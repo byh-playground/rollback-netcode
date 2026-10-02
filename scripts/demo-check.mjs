@@ -156,6 +156,11 @@ try {
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(base);
   await checkKoreanGuide(page);
+  await page.locator('#debug summary').click();
+  await page.click('#synctest');
+  await page.waitForFunction(()=>document.querySelector('#replay-result').dataset.result==='synctest-passed');
+  assert.match(await page.locator('#replay-result').textContent(),/결정론 검사 통과/);
+  await page.locator('#debug summary').click();
   for (const profile of ['action', 'rts', 'lockstep']) {
     const initial = await startLocal(page, profile);
     // Native keyboard events exercise the tutorial's A-player movement.

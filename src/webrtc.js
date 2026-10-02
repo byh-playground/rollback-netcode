@@ -7,7 +7,8 @@ export class WebRTCTransport {
     integer(highWaterMark, 'highWaterMark', CHUNK_SIZE, 16 * 1024 * 1024);
     integer(lowWaterMark, 'lowWaterMark', 0, highWaterMark);
     this.inputChannel = inputChannel ?? controlChannel; this.controlChannel = controlChannel;
-    this.highWaterMark = highWaterMark; this.listeners = new Set(); this.closed = false;
+    this.highWaterMark = highWaterMark; this.listeners = new Set(); this.statusListeners = new Set(); this.closed = false;
+    this.connectionState='connected';this._lastStatus=null;
     this.channels = [...new Set([this.inputChannel, this.controlChannel])];
     this._onMessage = async event => {
       if (this.closed) return;
@@ -26,8 +27,20 @@ export class WebRTCTransport {
     for (const channel of this.channels) {
       channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = lowWaterMark;
       channel.addEventListener('message', this._onMessage);
+      channel.addEventListener('open',this._onStatus= this._onStatus??(()=>this._notifyStatus()));
+      channel.addEventListener('close',this._onStatus);
+      channel.addEventListener('error',this._onChannelError=this._onChannelError??(()=>{this.connectionState='failed';this._notifyStatus()}));
     }
   }
+  get state(){
+    if(this.closed||this.connectionState==='closed'||this.channels.some(c=>c.readyState==='closed'||c.readyState==='closing'))return 'closed';
+    if(this.connectionState==='failed')return 'failed';
+    if(this.connectionState==='disconnected')return 'interrupted';
+    return this.channels.every(c=>c.readyState==='open')?'open':'connecting';
+  }
+  _notifyStatus(){const state=this.state;if(state===this._lastStatus)return;this._lastStatus=state;for(const listener of this.statusListeners){try{listener(state)}catch{}}}
+  setConnectionState(state){this.connectionState=state;this._notifyStatus()}
+  subscribeStatus(listener){if(typeof listener!=='function')throw new TypeError('status subscriber');this.statusListeners.add(listener);return()=>this.statusListeners.delete(listener)}
   get bufferedAmount() { return this.channels.reduce((n, c) => n + c.bufferedAmount, 0); }
   send(data) {
     const b = bytes(data);
@@ -45,8 +58,9 @@ export class WebRTCTransport {
   close() {
     if (this.closed) return;
     this.closed = true;
-    for (const channel of this.channels) { channel.removeEventListener('message', this._onMessage); channel.close(); }
-    this.listeners.clear();
+    this._notifyStatus();
+    for (const channel of this.channels) { channel.removeEventListener('message', this._onMessage);channel.removeEventListener('open',this._onStatus);channel.removeEventListener('close',this._onStatus);channel.removeEventListener('error',this._onChannelError);channel.close(); }
+    this.listeners.clear();this.statusListeners.clear();
   }
 }
 
@@ -99,6 +113,7 @@ export function createWebRTCPeer({ initiator = false, signaler, remoteId,
     } else flushCandidates();
   });
   pc.addEventListener('connectionstatechange', () => {
+    transport?.setConnectionState(pc.connectionState);
     status({ type: 'connection-state', state: pc.connectionState });
     if (pc.connectionState === 'failed') fail(new Error('P2P connection failed; no automatic TURN fallback'));
   });

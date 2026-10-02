@@ -1,12 +1,13 @@
-import { VERSION, PROTOCOL_VERSION, CHUNK_SIZE, MAX_TICK, defaults, profiles, encoder, decoder, MAGIC, TYPE, HEADER, SNAP_CHUNK_BYTES, Writer, Reader, packet, frameEqual, copyFrame } from './protocol.js';
+import { VERSION, PROTOCOL_VERSION, CHUNK_SIZE, MAX_TICK, defaults, profiles, encoder, decoder, MAGIC, TYPE, HEADER, SNAP_CHUNK_BYTES, Writer, Reader, packet, frameEqual, copyFrame, runSimulationFrame } from './protocol.js';
 import { nowMs, compareIds, integer, bytes, equalBytes, hashBytes } from './utilities.js';
 function profileOf(profile) {
   const p = { ...defaults, ...profile };
   for (const field of ['tickRate', 'stateHistorySize', 'checksumInterval', 'resimulationBudget', 'maxCatchupSteps',
     'heartbeatMs', 'adaptationIntervalMs', 'maxSnapshotBytes', 'maxHistoryBytes', 'maxReplayBytes', 'maxCommandBytes',
-    'maxPendingCommands', 'maxQueuedBytes', 'recoveryTimeoutMs', 'maxRecoveryAttempts']) integer(p[field], field, 1, 0x7fffffff);
+    'maxPendingCommands', 'maxQueuedBytes', 'recoveryTimeoutMs', 'maxRecoveryAttempts', 'peerInterruptMs', 'peerTimeoutMs']) integer(p[field], field, 1, 0x7fffffff);
   for (const field of ['baseInputDelayTicks', 'minInputDelayTicks', 'maxInputDelayTicks', 'rollbackWindowTicks', 'tickDriftThreshold']) integer(p[field], field, 0, 65535);
   if (p.minInputDelayTicks > p.baseInputDelayTicks || p.baseInputDelayTicks > p.maxInputDelayTicks) throw new RangeError('input delay bounds');
+  if (p.peerTimeoutMs <= p.peerInterruptMs) throw new RangeError('peerTimeoutMs must exceed peerInterruptMs');
   if (p.stateHistorySize < p.rollbackWindowTicks + 2) throw new RangeError('stateHistorySize must exceed rollback window by two');
   if (p.stateHistorySize > 8192) throw new RangeError('stateHistorySize capacity (8192)');
   if (p.tickRate > 240 || p.maxCommandBytes > CHUNK_SIZE - 1024 || p.maxSnapshotBytes > 64 * 1024 * 1024) throw new RangeError('profile size limit');
@@ -14,12 +15,12 @@ function profileOf(profile) {
   if (!['none', 'hold', 'dilation'].includes(p.pacingPolicy) || p.stallPolicy !== 'wait') throw new TypeError('pacing/stall policy');
   return Object.freeze(p);
 }
-class StateHistory {
+export class StateHistory {
   constructor(size, maxBytes = 64 * 1024 * 1024) { this.slots = new Array(size); this.size = size; this.maxBytes = maxBytes; this.byteLength = 0; }
   get(tick) { const s = this.slots[tick % this.size]; return s?.tick === tick ? s : undefined; }
   put(state) {
     const i = state.tick % this.size, next = this.byteLength - (this.slots[i]?.bytes.length ?? 0) + state.bytes.length;
-    if (next > this.maxBytes) throw new RangeError('state history byte budget');
+    if (next > this.maxBytes) throw Object.assign(new RangeError('state history byte budget'),{code:'history-capacity',requiredBytes:next,maxHistoryBytes:this.maxBytes,snapshotBytes:state.bytes.length});
     this.slots[i] = state; this.byteLength = next;
   }
   invalidateAfter(tick) {
@@ -44,8 +45,10 @@ export class RollbackSession {
     this.profile = profileOf(profile); this.adapter = adapter; this.onEvent = onEvent;
     this.authorityPlayerId = authorityPlayerId ?? this.players[0];
     if (!this.players.includes(this.authorityPlayerId)) throw new TypeError('authorityPlayerId');
-    this._tick = 0; this._inputDelay = this.profile.baseInputDelayTicks; this.closed = false;
+    this._tick = 0; this._inputDelay = this.profile.baseInputDelayTicks; this._requestedInputDelay = this._inputDelay;
+    this.closed = false; this._failure = null;
     this._history = new StateHistory(this.profile.stateHistorySize, this.profile.maxHistoryBytes);
+    this._inputWriter = new Writer(CHUNK_SIZE * this.players.length);
     this._inputs = new Map(this.players.map(p => [p, new Map()]));
     this._through = new Map(this.players.map(p => [p, -1]));
     this._used = new Map(); this._peers = new Map(); this._pendingCommands = [];
@@ -59,23 +62,83 @@ export class RollbackSession {
     this._metrics = { rollbacks: 0, resimulatedTicks: 0, maxRollbackDepth: 0, stalls: 0, holds: 0,
       recoveries: 0, rejectedSnapshots: 0, rejectedPackets: 0, sentBytes: 0, receivedBytes: 0,
       predictedTicks: 0, hashMismatches: 0, latestResimulationMs: 0, smoothedRTT: 0, jitter: 0,
-      lateInputRate: 0, rollbackFrequency: 0, stallFrequency: 0, resimulationCostMs: 0 };
+      lateInputRate: 0, rollbackFrequency: 0, stallFrequency: 0, resimulationCostMs: 0,
+      stateHashComputations:0,hashedStateBytes:0 };
     this._recordReplay = recordReplay; this._replayFrames = []; this._replayBytes = 0; this._replayFinalHash = undefined;
     const initial = this._save();
+    const requiredBytes=initial.length*this.profile.stateHistorySize;
+    if(requiredBytes>this.profile.maxHistoryBytes)throw Object.assign(new RangeError('initial snapshot cannot fill state history byte budget'),{code:'history-capacity',snapshotBytes:initial.length,requiredBytes,maxHistoryBytes:this.profile.maxHistoryBytes});
     this._initialState = initial.slice();
-    this._history.put({ tick: 0, bytes: initial, hash: hashBytes(initial), inputHash: this._inputHash });
+    const initialRecord={ tick: 0, bytes: initial, inputHash: this._inputHash };
+    this._history.put(initialRecord);
     this._hello = encoder.encode(JSON.stringify({ protocol: PROTOCOL_VERSION, library: VERSION, sessionId,
       simulationVersion, seed, players: this.players, tickRate: this.profile.tickRate, inputSize,
-      authorityPlayerId: this.authorityPlayerId, initialHash: hashBytes(initial) }));
+      authorityPlayerId: this.authorityPlayerId, initialHash: this._stateHash(initialRecord) }));
     for (let t = 0; t < this.inputDelay; t++) this._commitLocal(t, this._lastLocalInput, []);
   }
   get tick() { return this._tick; }
   get inputDelay() { return this._inputDelay; }
   get confirmedTick() { return Math.min(...this._through.values()); }
   get resimulating() { return this._resimTarget !== null || this._rollbackFrom !== Infinity || this._recoveryStage !== null; }
-  get ready() { return this.players.every(p => p === this.localPlayerId || this._peers.get(p)?.ready); }
-  get metrics() { return { ...this._metrics, inputDelay: this.inputDelay, confirmedTick: this.confirmedTick, tick: this.tick, pace: this._pace }; }
+  get failure() { return this._failure; }
+  get requestedInputDelay() { return this._requestedInputDelay; }
+  get ready() { return !this.closed && !this._failure && this.players.every(p => p === this.localPlayerId || this._peers.get(p)?.ready && this._peers.get(p).connectionState === 'connected'); }
+  get status() {
+    if (this.closed) return 'closed'; if (this._failure) return 'failed';
+    const peers=[...this._peers.values()];
+    if(peers.some(p=>p.connectionState==='disconnected'))return 'disconnected';
+    if(peers.some(p=>p.connectionState==='interrupted'))return 'interrupted';
+    if(!this.ready)return 'synchronizing';
+    if(this._requestedRecovery||this._recoveryStage)return 'recovering';
+    return this.resimulating?'resimulating':'running';
+  }
+  getPeerState(peerId) {
+    const peer=this._peers.get(peerId);if(!peer)return undefined;
+    return Object.freeze({peerId,state:peer.connectionState,handshakeComplete:peer.ready,lastReceivedAt:peer.lastReceivedAt,
+      simTick:peer.tick,confirmedInputTick:peer.confirmed,ackTick:peer.ack,rtt:peer.rtt,jitter:peer.jitter});
+  }
+  get metrics() { return { ...this._metrics, inputDelay: this.inputDelay, requestedInputDelay:this.requestedInputDelay,
+    confirmedTick: this.confirmedTick, tick: this.tick, pace: this._pace,retainedSnapshotBytes:this._history.byteLength }; }
+  _stateHash(state) {
+    if(!state)return undefined;
+    if(state.hash===undefined){state.hash=hashBytes(state.bytes);this._metrics.stateHashComputations++;this._metrics.hashedStateBytes+=state.bytes.length}
+    return state.hash;
+  }
+  _hashInputFrame(tick,inputs,previousHash){
+    const w=this._inputWriter.reset();w.u32(tick);
+    for(const f of inputs){w.raw(f.input);w.u16(f.commands.length);for(const c of f.commands){w.u32(c.sequence);w.u16(c.payload.length);w.raw(c.payload)}}
+    return hashBytes(w.usedBytes(),previousHash);
+  }
   _event(type, detail = {}) { try { this.onEvent({ type, tick: this.tick, ...detail }); } catch { /* Observers cannot change the protocol. */ } }
+  _fail(type, detail={}) {
+    if(this._failure||this.closed)return;
+    this._failure=Object.freeze({type,...detail});this._event(type,detail);
+  }
+  _peerTransition(peer,state,type,detail={}) {
+    if(peer.connectionState===state)return;
+    const previous=peer.connectionState;peer.connectionState=state;
+    if(type)this._event(type,{peerId:peer.id,previous,state,...detail});
+  }
+  _transportStatus(peer,state) {
+    const value=typeof state==='string'?state:state?.state;
+    peer.transportState=value;
+    if(value==='closed'||value==='failed')this._peerTransition(peer,'disconnected','peer-disconnected',{reason:'transport-'+value});
+    else if(value==='interrupted')this._peerTransition(peer,'interrupted','peer-interrupted',{reason:'transport-interrupted'});
+    // An open channel still needs a fresh, valid protocol packet to resume.
+  }
+  _peerAlive(peer,sequence,now) {
+    if(['closed','failed'].includes(peer.transportState))return;
+    const delta=peer.lastReceivedSequence===null?1:(sequence-peer.lastReceivedSequence)>>>0;
+    if(delta===0||delta>=0x80000000)return;
+    peer.lastReceivedSequence=sequence;peer.lastReceivedAt=now;
+    this._peerTransition(peer,'connected',peer.connectionState==='connecting'?null:'peer-resumed');
+  }
+  _peerLiveness(peer,now) {
+    if(['closed','failed'].includes(peer.transportState))return;
+    const silence=Math.max(0,now-peer.lastReceivedAt);
+    if(silence>=this.profile.peerTimeoutMs)this._peerTransition(peer,'disconnected','peer-timeout',{silenceMs:silence});
+    else if(silence>=this.profile.peerInterruptMs&&peer.connectionState!=='disconnected')this._peerTransition(peer,'interrupted','peer-interrupted',{reason:'silence',silenceMs:silence});
+  }
   _save() {
     const state = bytes(this.adapter.save(), 'snapshot').slice();
     if (!state.length || state.length > this.profile.maxSnapshotBytes) throw new RangeError('snapshot size');
@@ -84,16 +147,20 @@ export class RollbackSession {
   _nextSequence() { this._sequence = (this._sequence + 1) >>> 0; return this._sequence; }
   attachTransport(peerId, transport) {
     if (this.closed) throw new Error('session closed');
+    if (this._failure) throw new Error('session failed: '+this._failure.type);
     if (peerId === this.localPlayerId || !this.players.includes(peerId) || this._peers.has(peerId)) throw new TypeError('peerId already attached or outside roster');
     if (typeof transport?.send !== 'function' || typeof transport.subscribe !== 'function') throw new TypeError('Transport capability: send and subscribe');
     const peer = { id: peerId, transport, ready: false, ack: -1, tick: 0, confirmed: -1,
       clockSequence: null, clockAt: 0, lastSent: -Infinity, lastHello: -Infinity,
       pendingPings: new Map(), echo: 0, rtt: 0, jitter: 0, hashes: new Map(),
-      controls: [], queuedBytes: 0, lastHashQueued: 0, unsubscribe: null };
+      controls: [], queuedBytes: 0, lastHashQueued: 0, unsubscribe: null, unsubscribeStatus: null,
+      connectionState:'connecting',transportState:undefined,lastReceivedAt:this._clock(),lastReceivedSequence:null };
     this._peers.set(peerId, peer);
     peer.unsubscribe = transport.subscribe(data => this.receive(peerId, data));
+    peer.unsubscribeStatus=transport.subscribeStatus?.(state=>this._transportStatus(peer,state));
+    if(transport.state)this._transportStatus(peer,transport.state);
     this._sendHello(peer, this._clock());
-    return () => { peer.unsubscribe?.(); this._peers.delete(peerId); };
+    return () => { peer.unsubscribe?.(); peer.unsubscribeStatus?.(); this._peers.delete(peerId); };
   }
   _send(peer, data) {
     try {
@@ -117,16 +184,19 @@ export class RollbackSession {
   }
   queueCommand(payload) {
     if (this.closed) throw new Error('session closed');
+    if (this._failure) throw new Error('session failed: '+this._failure.type);
     const b = bytes(payload).slice();
-    if (!b.length || b.length > this.profile.maxCommandBytes || this._pendingCommands.length >= this.profile.maxPendingCommands) throw new RangeError('command capacity');
+    if (!b.length || b.length > Math.min(this.profile.maxCommandBytes,CHUNK_SIZE-1024-this.inputSize-6) || this._pendingCommands.length >= this.profile.maxPendingCommands) throw new RangeError('command capacity');
     integer(this._commandSequence + 1, 'command sequence', 1);
     const sequence = ++this._commandSequence;
     this._pendingCommands.push({ sequence, payload: b }); return sequence;
   }
   setInputDelay(ticks) {
     integer(ticks, 'input delay', this.profile.minInputDelayTicks, this.profile.maxInputDelayTicks);
-    if (ticks !== this.inputDelay) { const previous = this.inputDelay; this._inputDelay = ticks; this._event('input-delay', { previous, value: ticks }); }
+    this._requestedInputDelay=ticks;
+    if(ticks>this.inputDelay)this._applyInputDelay(ticks);
   }
+  _applyInputDelay(ticks){const previous=this.inputDelay;this._inputDelay=ticks;this._event('input-delay',{previous,value:ticks})}
   _capture(input) {
     const b = bytes(input);
     if (b.length !== this.inputSize) throw new RangeError('inputSize');
@@ -134,10 +204,12 @@ export class RollbackSession {
     this._lastLocalInput = b.slice();
     if (this._captureTick === this.tick) return;
     this._captureTick = this.tick;
+    // Reduce by one only when the sample is identical and no edge command waits.
+    // The next changed sample then has an uncommitted future slot; no pulse is lost.
+    if(this._requestedInputDelay<this.inputDelay&&equalBytes(b,previous)&&!this._pendingCommands.length)this._applyInputDelay(this.inputDelay-1);
     const target = integer(this.tick + this.inputDelay, 'session tick limit', 0, MAX_TICK);
     const through = this._through.get(this.localPlayerId);
-    // Delay reduction omits sampled held state until the old future prefix drains.
-    // Pending one-shot commands remain queued, never copied/dropped or retimed.
+    // Only an identical sample may be coalesced with an immutable future frame.
     if (target <= through) return;
     for (let t = through + 1; t < target; t++) this._commitLocal(t, previous, []);
     let budget = CHUNK_SIZE - 1024 - this.inputSize;
@@ -149,7 +221,7 @@ export class RollbackSession {
     this._commitLocal(target, this._lastLocalInput, commands);
   }
   releaseInput() {
-    if (this.closed) return;
+    if (this.closed || this._failure) return;
     this._lastLocalInput = new Uint8Array(this.inputSize);
     const last = this._inputs.get(this.localPlayerId).get(this._through.get(this.localPlayerId));
     if (last && equalBytes(last.input, this._lastLocalInput)) {
@@ -196,9 +268,10 @@ export class RollbackSession {
     }
   }
   poll(now = this._clock()) {
-    if (this.closed) return;
+    if (this.closed || this._failure) return;
     if (!Number.isFinite(now)) throw new TypeError('network time');
     for (const peer of this._peers.values()) {
+      this._peerLiveness(peer,now);
       if (!peer.ready) { if (now - peer.lastHello >= this.profile.heartbeatMs) this._sendHello(peer, now); continue; }
       if (now - peer.lastSent >= this.profile.heartbeatMs) { this._sendInputs(peer); this._sendClock(peer, now); }
       let sent = 0;
@@ -212,29 +285,41 @@ export class RollbackSession {
       if (this._recoveryStage) this._rejectSnapshot('candidate replay timeout');
       else this._requestedRecovery = null;
       this._event('recovery-timeout');
+      this._recoveryExhausted('timeout');
     }
     // Reconciliation must finish even when gameplay is paused at a terminal tick.
     // It consumes a bounded resimulation budget, never a new logical tick.
+    if(this._failure)return;
     if (this._recoveryStage) this._continueRecovery();
     else if (this.resimulating) this._rollback();
+    if(this._failure)return;
     this._adapt(now); this._sendHashes(); this._checkHashes(); this._recordConfirmed();
   }
   receive(peerId, data, now = this._clock()) {
-    if (this.closed) return false;
+    if (this.closed || this._failure) return false;
     const peer = this._peers.get(peerId);
-    if (!peer) return false;
+    if (!peer || ['closed','failed'].includes(peer.transportState)) return false;
     try {
       const b = bytes(data);
       if (b.length < HEADER || b.length > CHUNK_SIZE) throw new RangeError('packet size');
       const r = new Reader(b);
-      if (r.u32() !== MAGIC || r.u8() !== PROTOCOL_VERSION) throw new Error('protocol version');
+      if (r.u32() !== MAGIC) throw new Error('protocol magic');
+      const protocolVersion=r.u8();
+      if(protocolVersion!==PROTOCOL_VERSION){this._event('version-mismatch',{peerId,field:'protocol',expected:PROTOCOL_VERSION,received:protocolVersion});throw new Error('protocol version')}
       const type = r.u8(); if (r.u16() !== 0) throw new Error('reserved header');
       const sequence = r.u32();
       this._metrics.receivedBytes += b.length;
       if (type === TYPE.HELLO) {
         const hello = r.raw(b.length - HEADER); r.end();
-        if (!equalBytes(hello, this._hello)) throw new Error('session/simulation/roster/seed/version/initial-state mismatch');
+        if (!equalBytes(hello, this._hello)) {
+          const expected=JSON.parse(decoder.decode(this._hello)),received=JSON.parse(decoder.decode(hello));
+          const fields=Object.keys(expected).filter(field=>JSON.stringify(expected[field])!==JSON.stringify(received?.[field]));
+          if(!fields.length)throw new Error('noncanonical HELLO');
+          const type=fields.some(field=>['protocol','library','simulationVersion'].includes(field))?'version-mismatch':'handshake-mismatch';
+          this._fail(type,{peerId,fields:Object.freeze(fields),mismatches:Object.freeze(fields.map(field=>Object.freeze({field,expected:expected[field],received:received?.[field]})))});return false;
+        }
         const wasReady = peer.ready; peer.ready = true;
+        this._peerAlive(peer,sequence,now);
         if (!wasReady) { this._sendHello(peer, now); this._event('peer-ready', { peerId }); }
         return true;
       }
@@ -249,6 +334,7 @@ export class RollbackSession {
       } else if (type === TYPE.BEGIN) this._beginSnapshot(peer, r, now);
       else if (type === TYPE.CHUNK) this._snapshotChunk(peer, r);
       else throw new Error('unknown packet type');
+      this._peerAlive(peer,sequence,now);
       return true;
     } catch (error) {
       this._metrics.rejectedPackets++; this._event('protocol-error', { peerId, error }); return false;
@@ -340,22 +426,15 @@ export class RollbackSession {
     const tick = this.tick;
     integer(tick, 'session tick limit', 0, MAX_TICK);
     try {
-      this.adapter.step({ tick, tickRate: this.profile.tickRate,
-        inputs: inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })), resimulating });
-      const w = new Writer(CHUNK_SIZE * this.players.length);
-      w.u32(tick);
-      for (const f of inputs) {
-        w.raw(f.input); w.u16(f.commands.length);
-        for (const c of f.commands) { w.u32(c.sequence); w.u16(c.payload.length); w.raw(c.payload); }
-      }
-      const inputHash = hashBytes(w.finish(), this._inputHash);
+      runSimulationFrame(this.adapter, { tick, tickRate: this.profile.tickRate, inputs, resimulating });
+      const inputHash = this._hashInputFrame(tick,inputs,this._inputHash);
       const state = this._save();
-      this._history.put({ tick: tick + 1, bytes: state, hash: hashBytes(state), inputHash });
+      this._history.put({ tick: tick + 1, bytes: state, inputHash });
       this._used.set(tick, inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })));
       this._tick++; this._inputHash = inputHash;
     } catch (error) {
       if (before) this.adapter.load(before.bytes.slice());
-      this._event('fatal', { error }); throw error;
+      this._fail('fatal', { error }); throw error;
     }
   }
   _rollback() {
@@ -394,6 +473,9 @@ export class RollbackSession {
   advance(input = this._lastLocalInput) {
     if (this.closed) throw new Error('session closed');
     const now = this._clock(); this.poll(now);
+    if(this._failure)return {status:'failed',tick:this.tick,failure:this.failure};
+    if(['interrupted','disconnected'].includes(this.status))return {status:this.status,tick:this.tick};
+    if(this._requestedRecovery||this._recoveryStage)return {status:'recovering',tick:this.tick};
     if (this.resimulating) return { status: 'resimulating', tick: this.tick };
     this._capture(input);
     for (const peer of this._peers.values()) if (peer.ready) this._sendInputs(peer);
@@ -431,7 +513,7 @@ export class RollbackSession {
       const pressure = this._metrics.lateInputRate > .1 || this._metrics.rollbackFrequency > 2 ||
         w.depth > 3 || this._metrics.stallFrequency > 2 || this._metrics.resimulationCostMs > 1000 / this.profile.tickRate;
       if (pressure || measured > this.inputDelay + 1) {
-        this.setInputDelay(Math.min(this.profile.maxInputDelayTicks, this.inputDelay + 1)); this._stableWindows = 0;
+        this.setInputDelay(Math.min(this.profile.maxInputDelayTicks, Math.max(this.inputDelay + 1,measured))); this._stableWindows = 0;
       } else if (w.advances > 0 && !w.late && !w.stall && measured <= this.inputDelay - 1) {
         if (++this._stableWindows >= 3) { this.setInputDelay(Math.max(this.profile.minInputDelayTicks, this.inputDelay - 1)); this._stableWindows = 0; }
       } else this._stableWindows = 0;
@@ -453,7 +535,7 @@ export class RollbackSession {
     for (const peer of this._peers.values()) if (peer.ready && peer.lastHashQueued < t) {
       // Coalesce congestion into the newest retained confirmed boundary.
       // Unsent hashes remain derivable from the ring instead of an unbounded queue.
-      if (this._queue(peer, packet(TYPE.HASH, this._nextSequence(), w => { w.u32(t); w.u32(s.hash); w.u32(s.inputHash); }))) peer.lastHashQueued = t;
+      if (this._queue(peer, packet(TYPE.HASH, this._nextSequence(), w => { w.u32(t); w.u32(this._stateHash(s)); w.u32(s.inputHash); }))) peer.lastHashQueued = t;
     }
   }
   _checkHashes() {
@@ -463,18 +545,20 @@ export class RollbackSession {
       const local = this._history.get(tick);
       if (!local) { peer.hashes.delete(tick); continue; }
       if (local.inputHash !== remote.inputHash) { peer.hashes.delete(tick); this._event('input-history-mismatch', { peerId: peer.id, at: tick }); continue; }
-      if (local.hash !== remote.hash) {
+      if (this._stateHash(local) !== remote.hash) {
         if (!remote.notified) { remote.notified = true; this._metrics.hashMismatches++; this._event('desync', { peerId: peer.id, at: tick }); }
         if (this.localPlayerId === this.authorityPlayerId || this.requestResync(tick)) peer.hashes.delete(tick);
       } else peer.hashes.delete(tick);
     }
   }
-  getStateHash(tick = this.tick) { return this._history.get(tick)?.hash; }
+  getStateHash(tick = this.tick) { return this._stateHash(this._history.get(tick)); }
   requestResync(tick) {
+    if(this.closed||this._failure)return false;
     integer(tick, 'recovery tick', 0, Math.min(this.tick, this.confirmedTick + 1));
     if (this.localPlayerId === this.authorityPlayerId) return false;
     const peer = this._peers.get(this.authorityPlayerId);
-    if (!peer?.ready || this._requestedRecovery || this._recoveryAttempts >= this.profile.maxRecoveryAttempts) return false;
+    if (!peer?.ready || this._requestedRecovery) return false;
+    if(this._recoveryExhausted('attempt-limit'))return false;
     const state = this._history.get(tick); if (!state) return false;
     if (!this._queue(peer, packet(TYPE.REQUEST, this._nextSequence(), w => w.u32(tick)))) return false;
     this._requestedRecovery = { tick, inputHash: state.inputHash, at: this._clock() };
@@ -485,7 +569,7 @@ export class RollbackSession {
     const state = this._history.get(tick); if (!state) return;
     const transfer = (++this._nextTransfer) >>> 0, count = Math.ceil(state.bytes.length / SNAP_CHUNK_BYTES);
     const packets = [packet(TYPE.BEGIN, this._nextSequence(), w => {
-      w.u32(transfer); w.u32(tick); w.u32(state.bytes.length); w.u32(state.hash); w.u32(state.inputHash); w.u16(count);
+      w.u32(transfer); w.u32(tick); w.u32(state.bytes.length); w.u32(this._stateHash(state)); w.u32(state.inputHash); w.u16(count);
     })];
     for (let i = 0; i < count; i++) packets.push(packet(TYPE.CHUNK, this._nextSequence(), w => {
       w.u32(transfer); w.u32(i); w.raw(state.bytes.subarray(i * SNAP_CHUNK_BYTES, (i + 1) * SNAP_CHUNK_BYTES));
@@ -523,6 +607,11 @@ export class RollbackSession {
   _rejectSnapshot(reason) {
     this._incomingSnapshot = null; this._requestedRecovery = null; this._recoveryStage = null;
     this._metrics.rejectedSnapshots++; this._event('recovery-rejected', { reason });
+    this._recoveryExhausted(reason);
+  }
+  _recoveryExhausted(reason){
+    if(this._recoveryAttempts<this.profile.maxRecoveryAttempts)return false;
+    this._fail('desync-unrecoverable',{reason,attempts:this._recoveryAttempts,authorityPlayerId:this.authorityPlayerId});return true;
   }
   _commitSnapshot(candidate) {
     if (this.resimulating || !this._history.get(candidate.tick) || hashBytes(candidate.bytes) !== candidate.hash) { this._rejectSnapshot('expired or corrupt candidate'); return; }
@@ -546,17 +635,11 @@ export class RollbackSession {
       let work = 0;
       while (job.next < job.current && work < this.profile.resimulationBudget) {
         const t = job.next, inputs = this._resolve(t);
-        this.adapter.step({ tick: t, tickRate: this.profile.tickRate,
-          inputs: inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })),
+        runSimulationFrame(this.adapter, { tick: t, tickRate: this.profile.tickRate, inputs,
           resimulating: true, recovering: true });
-        const w = new Writer(CHUNK_SIZE * this.players.length); w.u32(t);
-        for (const f of inputs) {
-          w.raw(f.input); w.u16(f.commands.length);
-          for (const c of f.commands) { w.u32(c.sequence); w.u16(c.payload.length); w.raw(c.payload); }
-        }
-        job.inputHash = hashBytes(w.finish(), job.inputHash);
+        job.inputHash = this._hashInputFrame(t,inputs,job.inputHash);
         job.state = this._save();
-        job.staged.push({ tick: t + 1, bytes: job.state, hash: hashBytes(job.state), inputHash: job.inputHash });
+        job.staged.push({ tick: t + 1, bytes: job.state, inputHash: job.inputHash });
         job.stagedInputs.push([t, inputs]); job.next++; work++; this._metrics.resimulatedTicks++;
         job.stageBytes += job.state.length;
         if (job.stageBytes > this.profile.maxHistoryBytes) throw new RangeError('candidate replay byte budget');
@@ -585,14 +668,18 @@ export class RollbackSession {
     }
   }
   _recordConfirmed() {
-    if (!this._recordReplay || this.resimulating) return;
+    if (!this._recordReplay || this.resimulating || this._failure) return;
+    this._replayFinalState=this._history.get(this._replayFrames.length)??this._replayFinalState;
     const through = Math.min(this.confirmedTick, this.tick - 1);
     for (let t = this._replayFrames.length; t <= through; t++) {
       const inputs = this.players.map(playerId => ({ playerId, ...copyFrame(this._inputs.get(playerId).get(t)), predicted: false }));
       const n = inputs.reduce((s, f) => s + f.input.length + f.commands.reduce((k, c) => k + c.payload.length + 12, 0), 16);
-      if (this._replayBytes + n > this.profile.maxReplayBytes) { this._recordReplay = false; this._event('replay-capacity'); return; }
+      if (this._replayBytes + n > this.profile.maxReplayBytes) {
+        this._replayFinalHash=this._stateHash(this._replayFinalState);this._replayFinalState=null;
+        this._recordReplay = false; this._event('replay-capacity'); return;
+      }
       this._replayFrames.push({ tick: t, inputs }); this._replayBytes += n;
-      this._replayFinalHash = this._history.get(t + 1)?.hash;
+      this._replayFinalState = this._history.get(t + 1);
     }
   }
   exportReplay() {
@@ -603,7 +690,7 @@ export class RollbackSession {
       players: [...this.players], inputSize: this.inputSize, tickRate: this.profile.tickRate,
       initialState: this._initialState.slice(), frames: this._replayFrames.map(f => ({ tick: f.tick,
         inputs: f.inputs.map(x => ({ ...copyFrame(x), playerId: x.playerId, predicted: false })) })),
-      tick, hash: this._history.get(tick)?.hash ?? this._replayFinalHash ?? hashBytes(this._initialState),
+      tick, hash: this._stateHash(this._history.get(tick)) ?? this._stateHash(this._replayFinalState) ?? this._replayFinalHash ?? hashBytes(this._initialState),
       truncated: !this._recordReplay };
   }
   _prune() {
@@ -615,7 +702,7 @@ export class RollbackSession {
   close() {
     if (this.closed) return;
     this.closed = true;
-    for (const peer of this._peers.values()) { peer.unsubscribe?.(); peer.transport.close?.(); }
+    for (const peer of this._peers.values()) { peer.unsubscribe?.(); peer.unsubscribeStatus?.(); peer.transport.close?.(); }
     this._peers.clear(); this._incomingSnapshot = null; this._recoveryStage = null; this._pendingCommands.length = 0; this._event('closed');
   }
 }
@@ -626,7 +713,7 @@ export function playReplay({ adapter, replay, simulationVersion = replay?.simula
   let tick = 0;
   for (const f of replay.frames) {
     if (f.tick !== tick) throw new Error('non-contiguous replay');
-    adapter.step({ tick, tickRate: replay.tickRate, inputs: f.inputs.map(x => ({ ...copyFrame(x), playerId: x.playerId, predicted: false })), resimulating: true, replaying: true }); tick++;
+    runSimulationFrame(adapter, { tick, tickRate: replay.tickRate, inputs: f.inputs.map(x => ({ ...x, predicted: false })), resimulating: true, replaying: true }); tick++;
   }
   return { tick, hash: hashBytes(bytes(adapter.save())) };
 }

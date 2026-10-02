@@ -22,7 +22,7 @@ export function createLoop({ session, getInput = () => new Uint8Array(session.in
       accumulator = Math.min(accumulator + Math.max(0, Math.min(250, timestamp - last)), quantum * session.profile.maxCatchupSteps);
       last = timestamp; session.poll();
       let work = 0;
-      while (accumulator >= quantum * session.metrics.pace && work < session.profile.maxCatchupSteps) {
+      while (!session.resimulating && accumulator >= quantum * session.metrics.pace && work < session.profile.maxCatchupSteps) {
         const result = session.advance(getInput()); work++;
         if (result.status !== 'advanced') { accumulator = Math.min(accumulator, quantum); break; }
         accumulator -= quantum * session.metrics.pace;

@@ -1,5 +1,5 @@
 import { bytes, equalBytes } from './utilities.js';
-export const VERSION = '0.1.0-dev';
+export const VERSION = '0.2.0-dev';
 export const PROTOCOL_VERSION = 1;
 export const CHUNK_SIZE = 16384;
 export const MAX_TICK = 0x7ffffffe; // Signed ACK fields reserve -1 for no confirmed input.
@@ -13,13 +13,15 @@ export const defaults = {
   maxSnapshotBytes: 4 * 1024 * 1024, maxHistoryBytes: 64 * 1024 * 1024, maxReplayBytes: 64 * 1024 * 1024,
   maxCommandBytes: 2048, maxPendingCommands: 256, maxQueuedBytes: 5 * 1024 * 1024,
   recoveryTimeoutMs: 10000, maxRecoveryAttempts: 3,
+  peerInterruptMs: 1000, peerTimeoutMs: 10000,
 };
 export const profiles = Object.freeze({
   action: Object.freeze({ ...defaults }),
   rts: Object.freeze({ ...defaults, tickRate: 20, baseInputDelayTicks: 4,
     maxInputDelayTicks: 12, rollbackWindowTicks: 6, stateHistorySize: 32,
     predictionPolicy: 'neutral', checksumInterval: 20, resimulationBudget: 12 }),
-  lockstep: Object.freeze({ ...defaults, rollbackWindowTicks: 0,
+  lockstep: Object.freeze({ ...defaults, tickRate: 20, baseInputDelayTicks: 4,
+    maxInputDelayTicks: 20, rollbackWindowTicks: 0, checksumInterval: 20,
     stateHistorySize: 32, predictionPolicy: 'neutral' }),
 });
 
@@ -40,6 +42,8 @@ export class Writer {
   i32(n) { this.room(4); this.view.setInt32(this.offset, n, true); this.offset += 4; }
   raw(b) { this.room(b.length); this.data.set(b, this.offset); this.offset += b.length; }
   finish() { return this.data.slice(0, this.offset); }
+  reset() { this.offset = 0; return this; }
+  usedBytes() { return this.data.subarray(0, this.offset); }
 }
 export class Reader {
   constructor(data) { this.data = bytes(data); this.view = new DataView(this.data.buffer, this.data.byteOffset, this.data.byteLength); this.offset = 0; }
@@ -63,4 +67,10 @@ export function frameEqual(a, b) {
 }
 export function copyFrame(frame) {
   return { input: frame.input.slice(), commands: frame.commands.map(c => ({ ...c, payload: c.payload.slice() })) };
+}
+// Every live, recovery, replay and diagnostic execution crosses this same boundary.
+export function runSimulationFrame(adapter, context) {
+  return adapter.step({ ...context, inputs: context.inputs.map(frame => ({
+    ...copyFrame(frame), playerId: frame.playerId, predicted: !!frame.predicted,
+  })) });
 }

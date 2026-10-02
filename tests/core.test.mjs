@@ -640,17 +640,17 @@ test('duplicate transport packets do not abort a large staged snapshot recovery'
 });
 
 test('state history byte-budget exhaustion leaves the game state and logical tick unchanged', () => {
-  const pair = makePair({ inputForTick: () => new Uint8Array([0]), profile: { maxHistoryBytes: 64 } });
-  try {
-    drive(pair, 1);
-    const original = [...pair.sims[0].state];
-    const originalHash = pair.sessions[0].getStateHash();
-    assert.throws(() => pair.sessions[0].advance(new Uint8Array([1])), /history byte budget/);
-    assert.equal(pair.sessions[0].tick, 1);
-    assert.deepEqual([...pair.sims[0].state], original);
-    assert.equal(pair.sessions[0].getStateHash(), originalHash);
-    assert.equal(pair.sessions[0].getStateHash(2), undefined);
-  } finally { pair.close(); }
+  assert.throws(()=>makePair({profile:{maxHistoryBytes:64}}),error=>error.code==='history-capacity'&&error.requiredBytes===1024);
+  let tick=0,size=4;
+  const adapter={save(){const b=new Uint8Array(size);new DataView(b.buffer).setUint32(0,tick,true);return b},
+    load(b){size=b.length;tick=new DataView(b.buffer,b.byteOffset,b.byteLength).getUint32(0,true)},validateSnapshot:b=>b.length>=4,
+    step(){tick++;size=40}};
+  const session=createSession({players:['a'],localPlayerId:'a',sessionId:'growing',simulationVersion:'1',inputSize:1,adapter,
+    profile:{...profiles.lockstep,baseInputDelayTicks:0,stateHistorySize:4,maxHistoryBytes:64,adaptiveInputDelay:false}});
+  session.advance(new Uint8Array(1));const originalHash=session.getStateHash();
+  assert.throws(()=>session.advance(new Uint8Array(1)),error=>error.code==='history-capacity');
+  assert.equal(tick,1);assert.equal(session.tick,1);assert.equal(session.status,'failed');
+  assert.equal(session.getStateHash(),originalHash);assert.equal(session.getStateHash(2),undefined);session.close();
 });
 
 test('a capped replay retains its final hash after its last recorded state leaves the ring', () => {

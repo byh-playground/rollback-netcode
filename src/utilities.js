@@ -50,7 +50,13 @@ export const fixedPoint = Object.freeze({
   toNumber: (x) => signed(x) / 1024,
   add: (a, b) => signed(signed(a) + signed(b)),
   sub: (a, b) => signed(signed(a) - signed(b)),
-  mul: (a, b) => signed(Number(BigInt(signed(a)) * BigInt(signed(b)) / 1024n)),
+  mul: (a, b) => {
+    signed(a); signed(b);
+    const product=a*b;
+    // Exact integer product: the fast path preserves truncation, including -0.
+    if(Number.isSafeInteger(product))return signed(Math.trunc(product/1024)||0);
+    return signed(Number(BigInt(a)*BigInt(b)/1024n));
+  },
   div: (a, b) => {
     if (signed(b) === 0) throw new RangeError('fixed-point division by zero');
     return signed(Number(BigInt(signed(a)) * 1024n / BigInt(b)));
