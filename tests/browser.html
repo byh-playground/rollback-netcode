@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rollback netcode · real WebRTC check</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #101723; color: #eef4ff; }
+  body { margin: 0 auto; max-width: 1050px; padding: 38px 30px; }
+  h1 { margin-bottom: 8px; font-size: 30px; }
+  p { color: #a8b8cf; }
+  .cards { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; margin: 28px 0; }
+  .card { padding: 20px; background: #1a2638; border: 1px solid #354660; border-radius: 10px; }
+  .card small { display: block; color: #a8b8cf; }
+  .card strong { font-size: 27px; }
+  #status { padding: 12px 16px; background: #21344b; border-radius: 8px; }
+  #status.pass { background: #193d31; color: #c5f8df; }
+  #status.fail { background: #4c2330; color: #ffccd6; }
+  pre { background: #111e2e; padding: 20px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+<h1>Rollback netcode · real WebRTC check</h1>
+<p>Two browser pages exchange binary packets over real RTCPeerConnections. The simulation is compared with an offline integer oracle.</p>
+<div id="status">Waiting for the browser verification script.</div>
+<div class="cards">
+  <div class="card"><small>Local player</small><strong id="player">—</strong></div>
+  <div class="card"><small>Simulation tick</small><strong id="tick">0</strong></div>
+  <div class="card"><small>State hash</small><strong id="hash">—</strong></div>
+</div>
+<pre id="details">No connection yet.</pre>
+<script type="module">
+import { createSession, playReplay, profiles, WebRTCTransport, VERSION } from '../rollback-netcode.js';
+
+const ids = ['a', 'b'];
+const state = new Int32Array(8);
+const executedCommands = [];
+const tickRates = new Set();
+let peer;
+let inputChannel;
+let controlChannel;
+let session;
+let localPlayerId;
+let cleanup;
+const events = [];
+const errors = [];
+const candidates = [];
+
+function input(player, tick) {
+  return new Uint8Array([((tick * (player === 'a' ? 7 : 11) + (tick >> 2)) % 15) + 1]);
+}
+
+function simulate(targetState, { tick, tickRate, inputs }) {
+  if (tickRate !== 60 || targetState[4] !== tick) throw new Error('Simulation tick/rate contract violated');
+  for (let index = 0; index < inputs.length; index++) {
+    const frame = inputs[index];
+    if (frame.playerId !== ids[index]) throw new Error('Player order changed');
+    const value = frame.input[0];
+    targetState[index] += (value & 1 ? 2 : 0) - (value & 2 ? 1 : 0);
+    targetState[index + 2] += (value & 4 ? 3 : 0) - (value & 8 ? 2 : 0);
+    for (const command of frame.commands) {
+      if (command.executeTick !== tick) throw new Error('Command executed at wrong tick');
+      targetState[5]++;
+      targetState[6] += command.payload[0] + index * 100;
+      targetState[7] = (Math.imul(targetState[7], 31) + command.sequence + command.payload[0]) | 0;
+    }
+  }
+  targetState[4]++;
+}
+
+function adapterFor(targetState, capture = false) {
+  return {
+    save: () => new Uint8Array(targetState.buffer.slice(0)),
+    load(bytes) {
+      if (bytes.byteLength !== targetState.byteLength) throw new Error('Invalid snapshot shape');
+      targetState.set(new Int32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+    },
+    validateSnapshot: bytes => bytes.byteLength === targetState.byteLength,
+    step(frame) {
+      simulate(targetState, frame);
+      if (capture) {
+        tickRates.add(frame.tickRate);
+        for (const inputFrame of frame.inputs) for (const command of inputFrame.commands) {
+          executedCommands.push({ playerId: inputFrame.playerId, sequence: command.sequence, executeTick: command.executeTick, payload: [...command.payload] });
+        }
+      }
+    },
+  };
+}
+
+function setChannel(channel) {
+  if (channel.label === 'rollback-input') inputChannel = channel;
+  else if (channel.label === 'rollback-control') controlChannel = channel;
+  else throw new Error('Unknown channel');
+  channel.binaryType = 'arraybuffer';
+  channel.onerror = event => errors.push(`DataChannel ${channel.label}: ${event.error?.message || 'error'}`);
+}
+
+function refresh(extra = {}) {
+  const result = session ? {
+    version: VERSION,
+    player: localPlayerId,
+    tick: session.tick,
+    confirmedTick: session.confirmedTick,
+    hash: session.getStateHash(),
+    state: [...state],
+    metrics: session.metrics,
+    channels: {
+      input: { readyState: inputChannel.readyState, ordered: inputChannel.ordered, maxRetransmits: inputChannel.maxRetransmits },
+      control: { readyState: controlChannel.readyState, ordered: controlChannel.ordered },
+    },
+    connectionState: peer.connectionState,
+    ...extra,
+  } : { player: localPlayerId, connectionState: peer?.connectionState, ...extra };
+  document.getElementById('player').textContent = localPlayerId || '—';
+  document.getElementById('tick').textContent = result.tick ?? 0;
+  document.getElementById('hash').textContent = result.hash === undefined ? '—' : result.hash.toString(16).padStart(8, '0');
+  document.getElementById('details').textContent = JSON.stringify(result, null, 2);
+  return result;
+}
+
+window.harness = {
+  async createPeer(id, initiator) {
+    localPlayerId = id;
+    peer = new RTCPeerConnection({ iceServers: [] });
+    peer.onicecandidate = event => { if (event.candidate) candidates.push(event.candidate.toJSON()); };
+    peer.ondatachannel = event => setChannel(event.channel);
+    if (initiator) {
+      setChannel(peer.createDataChannel('rollback-input', { ordered: false, maxRetransmits: 0 }));
+      setChannel(peer.createDataChannel('rollback-control', { ordered: true }));
+    }
+    refresh();
+  },
+  async offer() {
+    await peer.setLocalDescription(await peer.createOffer());
+    return peer.localDescription.toJSON();
+  },
+  async answer(offer) {
+    await peer.setRemoteDescription(offer);
+    await peer.setLocalDescription(await peer.createAnswer());
+    return peer.localDescription.toJSON();
+  },
+  async acceptAnswer(answer) { await peer.setRemoteDescription(answer); },
+  takeCandidates() { return candidates.splice(0); },
+  async addCandidates(remoteCandidates) { for (const candidate of remoteCandidates) await peer.addIceCandidate(candidate); },
+  channelsOpen() { return inputChannel?.readyState === 'open' && controlChannel?.readyState === 'open'; },
+  start() {
+    if (!this.channelsOpen()) throw new Error('Both real DataChannels must be open before starting');
+    session = createSession({
+      players: ids, localPlayerId, sessionId: 'browser-real-webrtc', simulationVersion: 'integer-v1', seed: 17, inputSize: 1,
+      profile: { ...profiles.action, tickRate: 60, baseInputDelayTicks: 0, minInputDelayTicks: 0, maxInputDelayTicks: 8,
+        adaptiveInputDelay: false, pacingPolicy: 'none', rollbackWindowTicks: 12, stateHistorySize: 40,
+        checksumInterval: 8, resimulationBudget: 64, maxCatchupSteps: 64 },
+      adapter: adapterFor(state, true), onEvent: event => events.push(event),
+    });
+    const transport = new WebRTCTransport({ inputChannel, controlChannel, highWaterMark: 262144, lowWaterMark: 65536 });
+    cleanup = session.attachTransport(ids.find(id => id !== localPlayerId), transport);
+    document.getElementById('status').textContent = 'Connected over real WebRTC. Running deterministic simulation…';
+    return refresh();
+  },
+  step(target, count = 1) {
+    const results = [];
+    session.poll(performance.now());
+    for (let attempt = 0; attempt < count && session.tick < target; attempt++) {
+      results.push(session.advance(input(localPlayerId, session.tick)));
+    }
+    return { tick: session.tick, confirmedTick: session.confirmedTick, resimulating: session.resimulating, results };
+  },
+  poll() { session.poll(performance.now()); return { tick: session.tick, confirmedTick: session.confirmedTick, resimulating: session.resimulating }; },
+  command(payload) { return session.queueCommand(new Uint8Array(payload)); },
+  report(target) {
+    const uniqueCommands = [...new Map(executedCommands.map(command => [`${command.playerId}:${command.sequence}`, command])).values()];
+    const expected = new Int32Array(8);
+    for (let tick = 0; tick < target; tick++) simulate(expected, { tick, tickRate: 60, inputs: ids.map(playerId => ({
+      playerId, input: input(playerId, tick), commands: uniqueCommands.filter(command => command.playerId === playerId && command.executeTick === tick).map(command => ({ ...command, payload: new Uint8Array(command.payload) })),
+    })) });
+    const replayState = new Int32Array(8);
+    const replay = playReplay({ adapter: adapterFor(replayState), replay: session.exportReplay() });
+    const checks = {
+      actualDataChannels: inputChannel.readyState === 'open' && controlChannel.readyState === 'open' && peer.connectionState === 'connected',
+      inputChannelUnreliable: inputChannel.ordered === false && inputChannel.maxRetransmits === 0,
+      controlChannelReliable: controlChannel.ordered === true,
+      oracle: [...expected].every((value, index) => value === state[index]),
+      fixedTickRate: tickRates.size === 1 && tickRates.has(60),
+      oneShotCommand: state[5] === 1 && state[6] === 17,
+      replay: replay.tick === target && replay.hash === session.getStateHash() && [...replayState].every((value, index) => value === state[index]),
+      noBrowserErrors: errors.length === 0,
+    };
+    const passed = Object.values(checks).every(Boolean);
+    const status = document.getElementById('status');
+    status.textContent = passed ? 'PASS · real WebRTC, offline oracle, command and replay agree.' : 'FAIL · see checks below.';
+    status.className = passed ? 'pass' : 'fail';
+    return refresh({ passed, checks, expected: [...expected], replay, errors, eventCount: events.length });
+  },
+  close() { cleanup?.(); session?.close(); peer?.close(); },
+};
+</script>
+</html>

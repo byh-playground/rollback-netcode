@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>rollback-netcode · 동기화 확인 예제</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e7edf8;background:#10151f;font-synthesis:none;--muted:#99a8c0;--line:#2a3549;--panel:#182130;--accent:#b5f29a}
+    *{box-sizing:border-box}body{margin:0}main{width:min(940px,100%);margin:auto;padding:28px 20px 40px}a{color:#b5f29a}h1{font-size:clamp(1.6rem,5vw,2.1rem);margin:10px 0}h2{font-size:1rem;margin:0 0 14px}p{line-height:1.5;color:var(--muted);margin:8px 0 18px}.eyebrow{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}.header-line,.row,.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.header-line{justify-content:space-between}.badge{border:1px solid var(--line);border-radius:20px;padding:5px 10px;font-size:.75rem;color:var(--muted)}.panel{padding:18px;border:1px solid var(--line);background:var(--panel);border-radius:12px;margin-top:16px}.row label{display:flex;gap:6px;align-items:center;font-size:.85rem;color:var(--muted)}select,input,button{font:inherit;color:inherit;border:1px solid #43516b;background:#111b2b;border-radius:7px;min-height:42px;padding:8px 12px}button{cursor:pointer;touch-action:none}button:hover:not(:disabled){border-color:var(--accent)}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{cursor:default;opacity:.4}.primary{background:var(--accent);color:#16331a;border-color:var(--accent);font-weight:650}input{width:88px;letter-spacing:.1em}#connection-status{color:#d7e2f3;margin:14px 0 0;font-size:.9rem;overflow-wrap:anywhere}.room-code{font-size:1.8rem;letter-spacing:.18em;color:var(--accent);font-weight:700;padding:8px 0}canvas{display:block;width:100%;height:190px;border:1px solid var(--line);background:#111925;border-radius:8px}.controls,.peers{display:grid;grid-template-columns:1fr 1fr;gap:12px}.control{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:12px 0 4px}.control span{font-size:.85rem}.direction{width:48px;font-size:1.2rem}.direction.active{color:#152719;background:var(--accent)}.input-name{color:var(--muted);font-size:.8rem;min-width:42px}.peer{background:#121b2a;border:1px solid var(--line);border-radius:10px;padding:14px}.peer-title{display:flex;justify-content:space-between;gap:8px;margin-bottom:12px;font-size:.85rem}.runtime-status{color:var(--muted);font-size:.75rem}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px 7px;margin:0}.stats dt{font-size:.69rem;color:var(--muted);margin-bottom:4px}.stats dd{font:500 .98rem ui-monospace,SFMono-Regular,Consolas,monospace;margin:0;overflow-wrap:anywhere}.checksum{grid-column:1/-1}.note{font-size:.79rem;margin:12px 0 0}.actions{margin-top:15px}.actions button{font-size:.84rem}.replay-result{font-size:.83rem;color:var(--accent);min-height:1.4em;margin-top:12px;overflow-wrap:anywhere}details summary{cursor:pointer;color:#c6d4e9;font-size:.86rem}details p{font-size:.83rem}pre{font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:auto;max-height:330px;padding:12px;background:#111925;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}.footer{font-size:.77rem;margin-top:22px}#error-log{color:#ffb7a3}[hidden]{display:none!important}
+    .walkthrough{margin:0;padding-left:22px;line-height:1.65}.walkthrough li{margin:10px 0}.walkthrough strong{color:#e7edf8}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:.82rem;color:var(--muted);margin:10px 0}.legend span:first-child{color:#b5f29a}.legend span:last-child{color:#94bfff}.what-to-watch{border-left:3px solid var(--accent);padding-left:12px}.stats dt{line-height:1.35}.eyebrow{text-transform:none;letter-spacing:.05em}
+    @media(max-width:600px){main{padding:20px 12px 28px}.panel{padding:14px}.controls,.peers{grid-template-columns:1fr}.row{gap:8px}.row label{flex:1}select{width:100%}.row label:first-child{flex-basis:100%}.header-line{gap:5px}.actions button{flex:1;min-width:120px}canvas{height:165px}.stats{grid-template-columns:repeat(3,minmax(0,1fr))}.control{flex-wrap:wrap}.control>.row{flex-wrap:nowrap}.runtime-status{text-align:right}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="header-line"><span class="eyebrow">JS 한 파일로 사용하는 동기화 라이브러리</span><span class="badge">개발 중인 검증 예제</span></div>
+  <h1>rollback-netcode</h1>
+  <p>서로 다른 컴퓨터가 같은 게임을 계산하는 상황을 확인하는 예제예요. 처음에는 기본 설정에서 <strong>시작</strong>을 누르고, 아래 두 줄의 점과 점수가 함께 맞춰지는지 보세요.</p>
+  <section class="panel" aria-label="연결 설정">
+    <div class="row">
+      <label>연결 방식 <select id="mode"><option value="local">이 화면에서 두 컴퓨터 검증</option><option value="host">다른 기기와 연결: 방 만들기</option><option value="join">다른 기기와 연결: 방 참가</option></select></label>
+      <label>동기화 설정 <select id="profile"><option value="action">액션 · 초당 60틱</option><option value="rts">RTS · 초당 20틱</option><option value="lockstep">락스텝 · 입력을 기다려 진행</option></select></label>
+      <label id="room-label" hidden>방 번호 <input id="room-input" type="text" inputmode="numeric" autocomplete="off" maxlength="4" pattern="[0-9]{4}" aria-label="네 자리 방 번호"></label>
+      <button id="start" class="primary">시작</button><button id="stop" disabled>종료</button>
+    </div>
+    <div id="room-display" class="room-code" hidden></div>
+    <p id="connection-status" role="status" aria-live="polite" data-state="idle">준비됐어요. 기본 설정은 이 화면 안의 두 컴퓨터를 실제 WebRTC로 연결해요.</p>
+  </section>
+  <section class="panel" id="quick-guide" aria-label="처음 확인할 순서">
+    <h2>처음이면 이 순서로 확인하세요</h2>
+    <ol class="walkthrough">
+      <li><strong>시작 → 점 움직이기.</strong> 플레이어 A의 화살표를 잠깐 누른 뒤 놓으세요. 위·아래 줄은 각각 컴퓨터 A와 B의 계산 결과예요. 입력을 놓은 뒤 <strong>두 줄의 점 위치가 같아지면 정상</strong>이에요.</li>
+      <li><strong>A 점수 명령 → 점수 비교.</strong> 버튼을 한 번 누르세요. 컴퓨터 A와 B의 카드에서 <strong>플레이어 A 점수가 같은 값으로 올라가는지</strong> 보세요. 한 번의 명령이 양쪽에 전달되는 검증이에요.</li>
+      <li><strong>리플레이 확인 → 결과 일치.</strong> 움직임을 멈추고 누르세요. 저장한 입력을 처음부터 다시 계산해 <strong>“리플레이 결과 일치”</strong>가 나오면 재현에 성공한 거예요.</li>
+      <li><strong>복구도 보려면 개발자 상세를 여세요.</strong> <a href="#debug">상태를 고의로 어긋내기</a>를 누른 뒤, 컴퓨터 B의 <strong>상태 복구 횟수가 늘고 두 줄이 다시 맞는지</strong> 확인하세요.</li>
+    </ol>
+    <p class="note">기본 검증은 한 브라우저에 참가자 두 개를 만들고 실제 WebRTC로 통신해요. 별도 기기 두 대로 보려면 방 만들기·방 참가를 선택하세요. 기본 편도 지연은 80ms예요. 움직이는 동안 두 줄이 잠깐 다르거나 롤백 횟수가 늘어나는 것은 입력 예측을 고치는 정상 동작이에요.</p>
+  </section>
+  <section class="panel" aria-label="게임 계산 결과">
+    <h2>두 컴퓨터가 계산한 같은 게임</h2>
+    <div class="legend"><span>● 초록 점: 플레이어 A</span><span>● 파란 점: 플레이어 B</span></div>
+    <canvas id="simulation" width="860" height="190" aria-label="컴퓨터 A와 B가 계산한 두 플레이어의 위치">각 컴퓨터가 계산한 위치는 아래 개발자 상세에서도 확인할 수 있어요.</canvas>
+    <div class="controls">
+      <div class="control" data-control="a"><span id="control-a-label">플레이어 A <small>(← → 키)</small></span><span class="input-name" id="input-a">멈춤</span><div class="row"><button class="direction" data-player="a" data-input="1" aria-label="플레이어 A 왼쪽 이동">←</button><button class="direction" data-player="a" data-input="2" aria-label="플레이어 A 오른쪽 이동">→</button></div></div>
+      <div class="control" data-control="b"><span id="control-b-label">플레이어 B <small>(A D 키)</small></span><span class="input-name" id="input-b">멈춤</span><div class="row"><button class="direction" data-player="b" data-input="1" aria-label="플레이어 B 왼쪽 이동">←</button><button class="direction" data-player="b" data-input="2" aria-label="플레이어 B 오른쪽 이동">→</button></div></div>
+    </div>
+    <p class="note">화살표를 누르고 있으면 움직이고, 놓으면 멈춰요. 다른 창으로 이동해도 입력을 해제해요. 점수 명령은 같은 난수 기준으로 계산한 1~9점을 한 번 더해요.</p>
+    <div class="actions"><button id="command-a" disabled>A 점수 명령</button><button id="command-b" disabled>B 점수 명령</button><button id="release" disabled>모든 입력 해제</button><button id="replay" disabled>리플레이 확인</button></div>
+    <div id="replay-result" class="replay-result" aria-live="polite" data-result=""></div>
+  </section>
+  <section class="panel" aria-label="컴퓨터별 동기화 수치">
+    <h2>컴퓨터별 동기화 수치</h2>
+    <p class="note what-to-watch">먼저 <strong>플레이어 A·B 점수</strong>가 두 카드에서 같은지 보세요. <strong>롤백 횟수</strong>는 늦은 입력을 고친 횟수, <strong>상태 복구</strong>는 실제 불일치를 복구한 횟수예요.</p>
+    <div id="peers" class="peers"></div>
+    <p class="note">진행 틱(계산 단계)이 다르거나 입력을 예측 중이면 현재 상태 해시가 달라도 정상이에요. 라이브러리는 확정된 같은 입력 이력의 해시를 비교해서 오류를 판단해요.</p>
+  </section>
+  <details class="panel" id="debug">
+    <summary>개발자 상세 · 고의 오류와 복구 확인</summary>
+    <p>이 예제는 게임 상태를 32바이트 정수 데이터로 저장해요. 틱 하나의 계산 시간은 고정돼 있어요. 기본 검증은 이 페이지 안의 실제 WebRTC 연결 두 개를 사용하고, 방 연결에서는 Nostr가 상대 찾기와 연결 정보 전달만 담당해요.</p>
+    <div class="row"><button id="desync" disabled>상태를 고의로 어긋내기</button><label id="delay-label">새 입력 지연 <input id="delay-input" type="number" min="0" max="8" step="1" value="2" aria-label="입력 지연 틱 수"></label><button id="apply-delay" disabled>지연 적용</button><label>검증용 편도 지연 <select id="local-latency"><option value="0">0ms · 지연 없음</option><option value="80" selected>80ms · 기본 검증</option><option value="160">160ms · 더 느린 연결</option></select></label></div>
+    <p>고의 오류 버튼은 컴퓨터 B의 상태를 바꿔요. 확정 입력의 불일치를 감지하면 검증한 과거 상태에서 다시 계산해 복구해요. <strong>상태 복구 횟수 증가와 두 줄의 위치 일치</strong>를 보세요. 별도 기기로 테스트할 때는 B를 조작하는 기기에서 눌러 주세요.</p>
+    <p class="note">편도 지연은 시작 전에 선택하고, 새 입력 지연은 연결 후 적용해요. 아래 JSON과 오류 원문은 개발자가 원인을 확인하는 기술 정보예요. 이 화면은 라이브러리 검증용이며 완성된 게임은 아니에요.</p>
+    <pre id="debug-state">아직 시작하지 않았어요.</pre><pre id="error-log" hidden></pre>
+  </details>
+  <p class="footer"><a href="https://github.com/byh-playground/rollback-netcode/blob/codex/single-module-core/README.md#한국어-예제-확인-순서">한국어 예제 확인 안내</a> · <a href="./rollback-netcode.js" download>JS 모듈 다운로드</a><br>개발 중인 버전이에요. 다른 네트워크와 실제 게임의 출시 환경은 추가 검증이 필요해요.</p>
+</main>
+<script type="module">
+  import { VERSION, profiles, createSession, createWebRTCPeer, createNostrRoom, playReplay, hashBytes } from './rollback-netcode.js';
+
+  const $ = id => document.getElementById(id);
+  const ids = ['a', 'b'];
+  const canvas = $('simulation'), context = canvas.getContext('2d');
+  const inputs = { a: 0, b: 0 };
+  let peers = [], connections = [], connectionAbort = null, running = false, generation = 0, frameId = 0, previousTime = 0;
+  let lastDebugTime = 0, errors = [], remoteMode = false;
+  const status = (message, state) => { $('connection-status').textContent = message; if (state) $('connection-status').dataset.state = state; };
+  const feedback = (message, result = '') => { $('replay-result').textContent = message; $('replay-result').dataset.result = result; };
+  const stateNames = { ready: '준비', advanced: '진행 중', stalled: '입력 대기', held: '상대 진행 기다림', resimulating: '과거 다시 계산 중', synchronizing: '연결 확인 중' };
+  const showHash = hash => typeof hash === 'number' ? hash.toString(16).padStart(8, '0') : '아직 없음';
+  function explainError(error) {
+    const message = String(error?.message || error);
+    if (/finish rollback before exporting/i.test(message)) return '과거 입력을 다시 계산하는 중이에요. 움직임을 멈추고 잠시 뒤 다시 눌러 주세요.';
+    if (/already in use/i.test(message)) return '다른 사람이 같은 방 번호를 쓰고 있어요. 종료한 뒤 새 방을 만들어 주세요.';
+    if (/room discovery timeout/i.test(message)) return '상대를 찾지 못했어요. 두 기기의 방 번호와 동기화 설정이 같은지 확인해 주세요.';
+    if (/Nostr|relay|rate.limit|banned/i.test(message)) return '상대 연결 정보를 전달하는 공개 중계소를 사용할 수 없어요. 잠시 뒤 다시 시도하거나 이 화면의 두 컴퓨터 검증을 사용해 주세요.';
+    if (/P2P|WebRTC|connection.*timeout/i.test(message)) return '두 기기를 직접 연결하지 못했어요. 현재 네트워크에서는 연결이 제한될 수 있어요.';
+    if (/input delay|delay bounds/i.test(message)) return `입력 지연은 ${$('delay-input').min}~${$('delay-input').max} 범위의 정수로 입력해 주세요.`;
+    return '계산 또는 연결 중 오류가 생겼어요. 개발자 상세의 오류 원문을 확인해 주세요.';
+  }
+
+  function makeAdapter() {
+    // [nextTick, xA, xB, scoreA, scoreB, rng, commandCount, snapshotVersion]
+    let state = [0, -80, 80, 0, 0, 42, 0, 1], corruptNextStep = false;
+    const decode = bytes => {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength !== 32) throw new Error('상태 데이터는 32바이트여야 해요.');
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      return Array.from({ length: 8 }, (_, i) => i === 5 ? view.getUint32(i * 4, true) : view.getInt32(i * 4, true));
+    };
+    return {
+      save() {
+        const bytes = new Uint8Array(32), view = new DataView(bytes.buffer);
+        state.forEach((value, i) => i === 5 ? view.setUint32(i * 4, value, true) : view.setInt32(i * 4, value, true));
+        return bytes;
+      },
+      load(bytes) { state = decode(bytes); },
+      validateSnapshot(bytes, { tick } = {}) {
+        try {
+          const s = decode(bytes);
+          return s[7] === 1 && (tick === undefined || s[0] === tick) && s[0] >= 0 &&
+            Math.abs(s[1]) <= 500 && Math.abs(s[2]) <= 500 && s[3] >= 0 && s[4] >= 0 && s[5] !== 0 && s[6] >= 0;
+        } catch { return false; }
+      },
+      step({ tick, inputs: frames, resimulating }) {
+        for (const frame of [...frames].sort((a, b) => a.playerId < b.playerId ? -1 : a.playerId > b.playerId ? 1 : 0)) {
+          const player = ids.indexOf(frame.playerId);
+          if (player < 0) throw new Error('등록되지 않은 플레이어예요.');
+          const direction = frame.input[0] === 1 ? -1 : frame.input[0] === 2 ? 1 : 0;
+          state[player + 1] = Math.max(-500, Math.min(500, state[player + 1] + direction * 2));
+          for (const command of frame.commands) {
+            if (command.executeTick !== tick) throw new Error('명령의 확정 실행 틱이 달라졌어요.');
+            if (command.payload[0] !== 1) continue;
+            let x = state[5]; x ^= x << 13; x ^= x >>> 17; x ^= x << 5; state[5] = x >>> 0;
+            state[player + 3] += 1 + state[5] % 9; state[6]++;
+          }
+        }
+        // Deliberate test-only fault, outside the deterministic game contract.
+        if (!resimulating && corruptNextStep) { state[1] += state[1] > 463 ? -37 : 37; corruptNextStep = false; }
+        state[0] = tick + 1;
+      },
+      read() { return [...state]; },
+      corrupt() { corruptNextStep = true; }
+    };
+  }
+
+  function localSignalers() {
+    const handlers = new Map(), queued = new Map();
+    return Object.fromEntries(ids.map(id => [id, {
+      id,
+      async send(to, message) {
+        const event = { from: id, to, message };
+        if (handlers.has(to)) queueMicrotask(() => handlers.get(to)?.(event));
+        else { if (!queued.has(to)) queued.set(to, []); queued.get(to).push(event); }
+      },
+      subscribe(handler) {
+        handlers.set(id, handler);
+        for (const event of queued.get(id) || []) queueMicrotask(() => handlers.get(id)?.(event));
+        queued.delete(id);
+        return () => handlers.delete(id);
+      },
+      close() { handlers.delete(id); queued.delete(id); }
+    }]));
+  }
+
+  function delayedTransport(transport, milliseconds) {
+    if (!milliseconds) return transport;
+    // Bounded test impairment before a real RTCDataChannel send. No protocol parsing.
+    let queue = [], queuedBytes = 0, timer = 0, closed = false;
+    const flush = () => {
+      timer = 0;
+      while (queue.length && queue[0].due <= performance.now()) {
+        if (transport.send(queue[0].data) === false) break;
+        queuedBytes -= queue.shift().data.byteLength;
+      }
+      if (queue.length) timer = setTimeout(flush, Math.max(10, queue[0].due - performance.now()));
+    };
+    return {
+      send(bytes) {
+        if (closed || queue.length >= 2048 || queuedBytes + bytes.byteLength > 512 * 1024) return false;
+        const data = bytes.slice(); queue.push({ data, due: performance.now() + milliseconds }); queuedBytes += data.byteLength;
+        if (!timer) timer = setTimeout(flush, milliseconds);
+        return true;
+      },
+      subscribe(handler) { return transport.subscribe(handler); },
+      close() { closed = true; clearTimeout(timer); queue = []; queuedBytes = 0; transport.close?.(); }
+    };
+  }
+
+  function addPeer(id, sessionId, transport, profile) {
+    const adapter = makeAdapter();
+    const session = createSession({ players: ids, localPlayerId: id, sessionId,
+      simulationVersion: 'arithmetic-v1', seed: 42, inputSize: 1, profile, adapter });
+    session.attachTransport(id === 'a' ? 'b' : 'a', transport);
+    peers.push({ id, adapter, session, accumulator: 0, status: 'ready' });
+  }
+
+  function peerCard(peer) {
+    const card = document.createElement('article'); card.className = 'peer'; card.id = `peer-${peer.id}`;
+    card.innerHTML = `<div class="peer-title"><span>컴퓨터 ${peer.id.toUpperCase()}</span><span class="runtime-status" data-stat="status">준비</span></div><dl class="stats">${[
+      ['tick','진행 틱'],['confirmed','확정 입력 틱'],['delay','입력 지연(틱)'],['predicted','예측한 틱 수'],['rollback','롤백 횟수'],['stall','입력 대기 횟수'],['recovery','상태 복구 횟수'],['score-a','플레이어 A 점수'],['score-b','플레이어 B 점수'],['hash','현재 상태 해시']
+    ].map(([key,label]) => `<div class="${key === 'hash' ? 'checksum' : ''}"><dt>${label}</dt><dd data-stat="${key}">0</dd></div>`).join('')}</dl>`;
+    return card;
+  }
+
+  function setControls(enabled) {
+    for (const id of ['command-a','command-b','release','replay','desync','apply-delay']) $(id).disabled = !enabled;
+    document.querySelectorAll('.direction').forEach(button => { button.disabled = !enabled; });
+    $('start').disabled = enabled; $('mode').disabled = enabled; $('profile').disabled = enabled;
+    $('local-latency').disabled = enabled || $('mode').value !== 'local';
+    $('room-input').disabled = enabled; $('stop').disabled = !enabled;
+  }
+
+  function logError(error) {
+    errors.push(String(error?.stack || error)); errors = errors.slice(-4);
+    $('error-log').hidden = false; $('error-log').textContent = errors.join('\n\n');
+  }
+  function reportError(error) {
+    logError(error);
+    status(explainError(error), 'error');
+  }
+
+  function releaseAll() {
+    inputs.a = 0; inputs.b = 0;
+    for (const peer of peers) peer.session.releaseInput();
+    document.querySelectorAll('.direction').forEach(button => button.classList.remove('active'));
+    $('input-a').textContent = '멈춤'; $('input-b').textContent = '멈춤';
+  }
+
+  function stop(message = '종료했어요. 다시 검증하려면 시작을 눌러 주세요.') {
+    generation++; connectionAbort?.abort(); connectionAbort = null;
+    running = false; cancelAnimationFrame(frameId); releaseAll();
+    for (const peer of peers) peer.session.close();
+    for (const connection of connections) connection.close();
+    connections = []; peers = []; $('peers').replaceChildren(); $('debug-state').textContent = '아직 시작하지 않았어요.';
+    setControls(false); status(message, 'idle');
+    $('room-display').hidden = true; draw();
+  }
+
+  async function start() {
+    stop('연결을 준비하고 있어요…'); const token = generation;
+    const controller = new AbortController(); connectionAbort = controller;
+    errors = []; $('error-log').hidden = true; feedback('');
+    const mode = $('mode').value, name = $('profile').value, profile = profiles[name];
+    remoteMode = mode !== 'local';
+    let room = $('room-input').value;
+    if (mode === 'join' && !/^\d{4}$/.test(room)) { status('방 번호 네 자리를 입력해 주세요.', 'idle'); return; }
+    setControls(true);
+    document.querySelector('[data-control="a"]').hidden = false;
+    document.querySelector('[data-control="b"]').hidden = false;
+    $('command-a').hidden = false; $('command-b').hidden = false;
+    const keep = connection => {
+      if (token !== generation) { connection.close(); return false; }
+      connections.push(connection); return true;
+    };
+    try {
+      if (mode === 'local') {
+        status('이 화면의 두 컴퓨터를 실제 WebRTC로 연결하고 있어요…', 'connecting');
+        const signalers = localSignalers();
+        const answer = createWebRTCPeer({ initiator: false, signaler: signalers.b, remoteId: 'a', rtcConfig: { iceServers: [] }, signal: controller.signal });
+        const offer = createWebRTCPeer({ initiator: true, signaler: signalers.a, remoteId: 'b', rtcConfig: { iceServers: [] }, signal: controller.signal });
+        const results = await Promise.allSettled([offer, answer]);
+        const fulfilled = results.filter(result => result.status === 'fulfilled').map(result => result.value);
+        if (results.some(result => result.status === 'rejected')) {
+          for (const connection of fulfilled) connection.close();
+          throw results.find(result => result.status === 'rejected').reason;
+        }
+        const [a, b] = fulfilled;
+        if (!keep(a)) { b.close(); return; } if (!keep(b)) return;
+        const sessionId = `local-${crypto.randomUUID()}`;
+        const latency = Number($('local-latency').value);
+        addPeer('a', sessionId, delayedTransport(a.transport, latency), profile);
+        addPeer('b', sessionId, delayedTransport(b.transport, latency), profile);
+        status(`연결됐어요. 아래 두 줄을 비교해 보세요. 검증용 편도 지연은 ${latency}ms예요.`, 'connected');
+      } else {
+        if (!window.isSecureContext) throw new Error('방 연결은 HTTPS 또는 localhost에서 실행해야 해요.');
+        if (mode === 'host') room = String(crypto.getRandomValues(new Uint32Array(1))[0] % 10000).padStart(4, '0');
+        $('room-display').textContent = room; $('room-display').hidden = false;
+        status(mode === 'host' ? `방 번호는 ${room}예요. 다른 기기에서 같은 동기화 설정을 선택하고 방에 참가해 주세요.` : `방 ${room}의 상대를 찾고 있어요…`, 'connecting');
+        const connection = await createNostrRoom({ role: mode, room, namespace: `rollback-netcode-demo-v1-${name}`, signal: controller.signal });
+        if (!keep(connection)) return;
+        addPeer(connection.localPlayerId, connection.sessionId, connection.transport, profile);
+        const other = connection.remotePlayerId;
+        document.querySelector(`[data-control="${other}"]`).hidden = true; $(`command-${other}`).hidden = true;
+        status(`방 ${room}에 연결됐어요. 이 기기에서는 플레이어 ${connection.localPlayerId.toUpperCase()}를 조작해요.`, 'connected');
+      }
+      $('peers').replaceChildren(...peers.map(peerCard));
+      const first = peers[0].session;
+      $('delay-input').value = first.inputDelay;
+      // Bounds are profile policy; changing delay affects only newly committed input.
+      $('delay-input').min = String(profile.minInputDelayTicks); $('delay-input').max = String(profile.maxInputDelayTicks);
+      running = true; previousTime = performance.now(); lastDebugTime = 0; frameId = requestAnimationFrame(frame);
+    } catch (error) {
+      if (token !== generation) return;
+      stop(); reportError(error);
+    }
+  }
+
+  function frame(now) {
+    if (!running) return;
+    try {
+      const elapsed = Math.min(100, Math.max(0, now - previousTime)); previousTime = now;
+      for (const peer of peers) {
+        peer.session.poll(now);
+        const tickMs = 1000 / profiles[$('profile').value].tickRate;
+        peer.accumulator = Math.min(tickMs * 4, peer.accumulator + elapsed);
+        let steps = 0;
+        while (peer.accumulator >= tickMs && steps++ < 4) {
+          const result = peer.session.advance(new Uint8Array([inputs[peer.id]]));
+          peer.status = result.status;
+          if (peer.status !== 'advanced') { peer.accumulator = 0; break; }
+          peer.accumulator -= tickMs;
+        }
+      }
+      draw();
+      if (now - lastDebugTime >= 150) { updateMeasurements(); lastDebugTime = now; }
+      frameId = requestAnimationFrame(frame);
+    } catch (error) { stop(); reportError(error); }
+  }
+
+  function draw() {
+    const ratio = window.devicePixelRatio || 1, width = canvas.clientWidth, height = canvas.clientHeight;
+    if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+      canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+    }
+    context.setTransform(ratio, 0, 0, ratio, 0, 0); context.clearRect(0, 0, width, height);
+    context.font = '12px system-ui'; context.textBaseline = 'middle';
+    const rows = peers.length ? peers : [{ id: 'a', adapter: makeAdapter() }, { id: 'b', adapter: makeAdapter() }];
+    rows.forEach((peer, index) => {
+      const y = height * (index + 1) / (rows.length + 1), state = peer.adapter.read();
+      context.strokeStyle = '#2a3549'; context.beginPath(); context.moveTo(48, y); context.lineTo(width - 20, y); context.stroke();
+      context.fillStyle = '#99a8c0'; context.fillText(`컴퓨터 ${peer.id.toUpperCase()}의 계산`, 8, y - 21);
+      for (let player = 0; player < 2; player++) {
+        const x = 48 + (state[player + 1] + 500) / 1000 * (width - 68);
+        context.fillStyle = player ? '#94bfff' : '#b5f29a'; context.beginPath(); context.arc(x, y, 8, 0, Math.PI * 2); context.fill();
+        context.fillText(`${ids[player].toUpperCase()} ${state[player + 1]}`, Math.max(48, Math.min(width - 55, x - 14)), y + 18 + player * 14);
+      }
+    });
+  }
+
+  function updateMeasurements() {
+    const snapshots = [];
+    for (const peer of peers) {
+      const session = peer.session, metrics = session.metrics, state = peer.adapter.read();
+      const values = { status: stateNames[peer.status] || peer.status, tick: session.tick, confirmed: session.confirmedTick,
+        delay: session.inputDelay, predicted: metrics.predictedTicks, rollback: metrics.rollbacks,
+        stall: metrics.stalls, recovery: metrics.recoveries, 'score-a': state[3], 'score-b': state[4], hash: showHash(session.getStateHash()) };
+      for (const [key,value] of Object.entries(values)) $(`peer-${peer.id}`).querySelector(`[data-stat="${key}"]`).textContent = String(value);
+      snapshots.push({ peer: peer.id, status: peer.status, tick: session.tick, confirmedTick: session.confirmedTick,
+        inputDelay: session.inputDelay, positions: state.slice(1, 3), scores: state.slice(3, 5), commandCount: state[6], snapshotBytes: 32, metrics });
+    }
+    $('debug-state').textContent = JSON.stringify({ version: VERSION, connection: remoteMode ? 'Nostr로 방 연결 / WebRTC로 게임 입력 전송' : '이 화면에서 상대 연결 / WebRTC로 게임 입력 전송', testOneWayLatencyMs: remoteMode ? 0 : Number($('local-latency').value), peers: snapshots }, null, 2);
+  }
+
+  function setInput(id, value) {
+    if (!running || !peers.some(peer => peer.id === id)) return;
+    inputs[id] = value; $(`input-${id}`).textContent = ['멈춤','왼쪽','오른쪽'][value];
+    document.querySelectorAll(`[data-player="${id}"]`).forEach(button => button.classList.toggle('active', Number(button.dataset.input) === value));
+    if (!value) peers.find(peer => peer.id === id).session.releaseInput();
+  }
+  document.querySelectorAll('.direction').forEach(button => {
+    button.addEventListener('pointerdown', event => { event.preventDefault(); button.setPointerCapture(event.pointerId); setInput(button.dataset.player, Number(button.dataset.input)); });
+    for (const event of ['pointerup','pointercancel','lostpointercapture']) button.addEventListener(event, () => setInput(button.dataset.player, 0));
+  });
+  const keys = { ArrowLeft: ['a',1], ArrowRight: ['a',2], a: ['b',1], d: ['b',2], A: ['b',1], D: ['b',2] };
+  window.addEventListener('keydown', event => {
+    if (!running || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName)) return;
+    if (keys[event.key]) { event.preventDefault(); setInput(...keys[event.key]); }
+  });
+  window.addEventListener('keyup', event => { if (keys[event.key]) { event.preventDefault(); setInput(keys[event.key][0], 0); } });
+  window.addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); previousTime = performance.now(); for (const peer of peers) peer.accumulator = 0; });
+  window.addEventListener('pagehide', () => stop('페이지를 닫았어요.'));
+  window.addEventListener('resize', draw);
+  $('mode').addEventListener('change', () => { $('room-label').hidden = $('mode').value !== 'join'; $('local-latency').disabled = $('mode').value !== 'local'; status($('mode').value === 'local' ? '준비됐어요. 기본 설정은 이 화면 안의 두 컴퓨터를 실제 WebRTC로 연결해요.' : '두 기기에서 같은 동기화 설정을 선택하세요. 만든 방 번호 네 자리로 상대와 직접 연결해요.', 'idle'); });
+  $('room-input').addEventListener('input', () => { $('room-input').value = $('room-input').value.replace(/\D/g, '').slice(0, 4); });
+  $('start').addEventListener('click', start); $('stop').addEventListener('click', () => stop()); $('release').addEventListener('click', releaseAll);
+  for (const id of ids) $(`command-${id}`).addEventListener('click', () => {
+    const peer = peers.find(peer => peer.id === id); if (!peer) return;
+    try {
+      const sequence = peer.session.queueCommand(new Uint8Array([1]));
+      feedback(`플레이어 ${id.toUpperCase()}의 점수 명령 ${sequence}번을 전달했어요. 두 카드의 점수를 비교하세요.`, 'queued');
+    } catch (error) { logError(error); feedback(explainError(error), 'error'); }
+  });
+  $('desync').addEventListener('click', () => {
+    const target = peers.find(peer => peer.id === 'b') || peers[0]; if (!target) return;
+    if (remoteMode && target.id !== 'b') { feedback('고의 오류 검증은 플레이어 B를 조작하는 기기에서 눌러 주세요.', 'pending'); return; }
+    target.adapter.corrupt(); feedback(`컴퓨터 ${target.id.toUpperCase()}의 상태를 고의로 바꿨어요. 상태 복구 횟수가 늘고 위치가 다시 맞는지 보세요.`, 'pending');
+  });
+  $('apply-delay').addEventListener('click', () => {
+    try { const ticks = Number($('delay-input').value); for (const peer of peers) peer.session.setInputDelay(ticks); feedback(`이제 새로 들어오는 입력에 ${ticks}틱 지연을 적용해요. 이미 확정된 명령의 실행 틱은 그대로예요.`); }
+    catch (error) { logError(error); feedback(explainError(error), 'error'); }
+  });
+  $('replay').addEventListener('click', () => {
+    try {
+      const peer = peers[0]; if (!peer) return;
+      if (peer.session.resimulating) { feedback('과거 입력을 다시 계산하는 중이에요. 움직임을 멈추고 잠시 뒤 다시 눌러 주세요.', 'pending'); return; }
+      const replay = peer.session.exportReplay(), adapter = makeAdapter();
+      playReplay({ adapter, replay });
+      const actual = hashBytes(adapter.save()), passed = actual === replay.hash;
+      feedback(`${passed ? '리플레이 결과 일치' : '리플레이 결과 불일치'} · 확정된 입력 ${replay.frames.length}틱을 다시 계산했어요. · 해시 ${showHash(actual)}`, passed ? 'matched' : 'mismatch');
+      if (!passed) throw new Error(`리플레이 해시 ${showHash(actual)}가 원래 해시 ${showHash(replay.hash)}와 달라요.`);
+    } catch (error) { logError(error); feedback(explainError(error), 'error'); }
+  });
+  setControls(false); draw();
+</script>
+</body>
+</html>
