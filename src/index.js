@@ -7,3 +7,4 @@ export { createNostrRoom } from './room.js';
 export { nostrCrypto } from './nostr-crypto.js';
 export { createNostrSignaler } from './nostr.js';
 export { createSyncTestSession, SyncTestSession, runSyncTest, DeterminismError } from './synctest.js';
+export { createValueCodec, binaryCodec, jsonCodec } from './value-codec.js';

@@ -56,3 +56,19 @@ fixed-point 100,000회 제한 범위 곱셈은 BigInt 기준 22.99ms, 안전 정
 현재 생성 JS SHA-256은 `e577f63fc8f5e88e55202afbb354aa3f50e95f8847d04987a77d0211488ff77a`입니다. 같은 hash의 `versions/` 파일을 준비하고 일치 검사를 통과했습니다. 이 기록은 Pages 공개 게시를 뜻하지 않습니다.
 
 실제 모바일 기기, Safari/Firefox 간 결정론, 외부 NAT 환경 두 기기, 장시간 신뢰성, 암호 코드 독립 감사는 미검증입니다. sparse snapshot 간격은 도입하지 않았습니다. 큰 state에는 적절한 history/byte budget이 필요하며 게임의 저장·복원 비용을 별도로 측정해야 합니다.
+
+## 공통 값 코덱 추가 검증 (2026-10-03)
+
+기본 binary/선택 JSON `encode/decode` capability를 추가했습니다. Core는 codec을 import하지 않고 게임 구조를 모르는 opaque bytes 계약을 유지합니다. `npm test` 82/82 PASS: 순서가 다른 record의 정규 bytes, Unicode/값 왕복, Uint8Array, 모든 길이의 잘림, 여분 byte, 잘못된 tag/UTF-8, 중복 JSON key, cycle/undefined/비유한 number, 깊이·값 개수·byte 한도, prototype key 처리를 포함합니다. `node scripts/build.mjs`로 단일 ES 모듈을 재생성했고 test가 source API/types/generated artifact 일치를 검사했습니다.
+
+후보 binary 코덱은 JSON body를 포함하지 않습니다. 이 추가 자체의 실제 게임 성능·두 브라우저 RTC·모바일 UI 검증은 랠리 통합 검증에서 기록해야 합니다. 이 변경은 공개 배포나 머지가 아니며, 앞 절의 SHA-256은 이전 후보 기록입니다. 신규 API를 포함하는 공개 URL과 immutable version URL의 게시 완료를 주장하지 않습니다.
+
+코덱 성능 재검토로 binary encode의 정규화 객체 복사를 제거하고 validation과 write를 합쳤습니다. Writer DataView는 버퍼 성장 때만 재생성합니다. 문자열 UTF-8 cache는 최대 1,024개/128 KiB로 제한합니다. int32는 최소 길이 zigzag varint로 저장하고, decoder는 직접 정규성을 검사하여 전체 재인코딩을 제거합니다. Uint8Array 결과는 소유한 독립 복사이며 문자열 BOM은 보존합니다. 부호/경계/비정규 varint/float64 정수 중복 표현/BOM 테스트를 추가해 `npm test` 83/83 PASS입니다. 실제 랠리 총 CPU 수치는 통합 측정 기록을 따릅니다.
+
+반복 필드의 크기/복원 비용을 줄이기 위해 payload 내부 문자열 dictionary를 추가했습니다. 최초 문자열은 UTF-8 literal, 다음 같은 문자열은 최소 varuint 인덱스 참조(tag 9)로 저장합니다. 필드 이름과 문자열 값을 같은 dictionary에 보관하며 등록 순서는 정규 순회로 결정됩니다. 미등록 참조·중복 literal·비최소 인덱스는 거부합니다. dictionary의 등록/참조는 기존 maxEntries/byte 한도의 적용을 받습니다. 일반 record 필드는 직접 할당하고 `__proto__`만 안전한 own property로 정의합니다. 관련 테스트 포함 `npm test` 84/84 PASS입니다.
+
+300개 record의 다수 문자열(1-byte 범위를 넘는 reference index), 혼합 수, 호출 사이 dictionary 격리, 잘림/항목 한도 테스트까지 추가해 최종 `npm test` 85/85 PASS입니다.
+
+2026-10-03 랠리 URL 소비 연계 검증: 실제 Edge RTC 240tick/oracle/replay hash 67059ea7 일치. 랠리 후보는 URL 응답을 명시적으로 후보 생성물로 제공한 테스트에서 상태 11, AI 9, 수명주기 6 검사를 통과했다. 손실/지연/역순 깊이3 롤백, 종료 깊이5 롤백, 손상 chunk 거부 후 복구와 replay 결과 일치를 확인했다. 공개 API 미배포/오프라인 로딩 실패를 실제 URL 경로에서 오류로 표시한다. 후보 검증과 공개 배포 성공은 구분한다.
+
+랠리 78/158유닛에서 같은 상태·35tick 결과가 JSON/바이너리로 동일했다. 반복 문자열 참조 후 126427→43675B, 232165→75253B. 숫자 바이트 hash는 포맷 변경으로 달라지므로 복원 데이터/최종 게임 결과를 비교했다. 중복 JSON 복사를 제거한 JSON만의 restore는 binary보다 빠를 수 있으며 바이너리가 모든 비용에서 우세하다고 주장하지 않는다. 전체 벤치 재현은 랠리 scripts/netcode-codec-benchmark.cjs에 있다.

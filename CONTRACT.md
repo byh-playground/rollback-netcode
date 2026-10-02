@@ -81,3 +81,11 @@ Nostr 수신 서명 검증은 저렴한 형식·room·recipient·중복 검사�
 용어와 롤백 모델은 공식 [GGPO 소개](https://www.ggpo.net/), [GGRS 0.13 문서](https://docs.rs/ggrs/0.13.0/ggrs/), [세션 설정 문서](https://docs.rs/ggrs/0.13.0/ggrs/struct.SessionBuilder.html)를 참고합니다. 이 라이브러리는 독립적인 브라우저 구현이며, 해당 프로젝트와의 호환성이나 같은 수준의 완성도를 주장하지 않습니다.
 
 Nostr 시그널링은 [NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md)을 따릅니다. 이벤트 서명은 [BIP-340 Schnorr 서명](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki)을 사용하며, 공식 [BIP-340 테스트 벡터](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv)를 검증 참고 자료로 사용합니다. 시그널링 키는 짧은 수명으로 사용하고 게임 플레이어 ID와 분리합니다.
+
+## 값 직렬화 capability
+
+Core는 상태·명령을 게임 구조를 모르는 opaque bytes로 취급한다. Adapter는 `createValueCodec`의 `encode/decode` capability를 Has-a로 합성할 수 있으며 기본 binary와 명시적으로 선택하는 JSON이 같은 계약을 제공한다. 값 코덱은 게임 필드/Entity/명령 schema를 정의하지 않는다. 권위 필드의 선택·검증은 Adapter 책임이다. 이후 simulation에 영향을 주는 Cache를 포함해 모든 권위 값을 보존하고 렌더링 전용 값을 제외한다.
+
+binary는 RV version 1 헤더, 타입 태그, little-endian 길이/유한 float64 및 int32 최소 zigzag varint, 유효 UTF-8과 UTF-16 사전순 record key를 사용한다. -0은 0으로 정규화하며 지원하지 않는 값과 비정규 bytes는 거부한다. decode는 크기·깊이·값 개수 한도와 완전한 소비를 검사한다. 형식 변경의 byte hash 차이는 게임 결과 차이의 근거가 아니므로 복원 권위 상태·입력별 최종 결과 동등성과 실제 게임 총 CPU를 함께 검증한다.
+
+바이너리 문자열은 payload별 최초 등록 순서 dictionary를 사용하고 반복 key/value를 최소 varuint 참조로 기록한다. 이전 payload나 cache 상태는 직렬화 결과에 영향을 주지 않으며 중복 literal/미등록 참조를 거부한다. dictionary에도 기존 값 개수·byte 예산을 적용한다.

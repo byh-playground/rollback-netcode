@@ -146,3 +146,23 @@ Node와 Playwright는 기여자 검사 도구이며 소비자 실행 의존성�
 현재 결과와 미검증 범위는 [검증 기록](docs/verification.md), 작업 운영은 [AGENTS.md](AGENTS.md)를 참고하세요.
 
 실제 게임 비용은 선택적 `scripts/rally-benchmark.mjs`로 분리 측정합니다. `RALLY_HTML`에 Adapter가 있는 RALLY FRONTIER HTML, `RALLY_REPO`에 그 Git 저장소를 지정합니다. `RALLY_PAIRED=1`은 같은 프레임에서 실행 순서를 번갈아 비교하며 게임 step·Adapter save·Core와 연결부의 잔여 비용을 따로 기록합니다. 외부 게임 저장소는 라이브러리 소비자/기본 CI의 의존성이 아닙니다.
+
+## 공통 값 코덱 capability (0.2 개발 후보)
+
+`createValueCodec()`의 기본 형식은 `binary`입니다. `binaryCodec`는 기본 인스턴스이며 `jsonCodec` 또는 `createValueCodec({format:'json'})`으로 UTF-8 JSON을 명시적으로 선택합니다. 둘 다 `encode(value): Uint8Array`, `decode(bytes): value`를 제공하며 Adapter가 Has-a로 소유하고 상태/명령 계약에 맞는 값만 전달합니다. Core는 코덱·게임 구조를 모르고 opaque bytes만 보관·해시·전송합니다.
+
+```js
+import { binaryCodec, createValueCodec } from './rollback-netcode.js';
+const stateCodec = binaryCodec;
+const commandCodec = createValueCodec({ maxBytes: 4096, maxDepth: 16 });
+const bytes = stateCodec.encode({ tick: 1, seed: 42, units: [] });
+const snapshot = stateCodec.decode(bytes);
+```
+
+바이너리는 `RV`/version 1 헤더와 타입 태그를 사용합니다. 길이는 unsigned 32-bit little-endian, int32 범위 정수는 최소 길이 zigzag varint, 나머지 number는 유한 IEEE-754 float64 little-endian이고 -0은 0으로 정규화합니다. 문자열은 유효한 UTF-8이며 record 키는 JavaScript UTF-16 사전순으로 정렬합니다. null·boolean·number·string·array·plain record를 지원하고 바이너리는 Uint8Array도 지원합니다. JSON은 bytes를 지원하지 않습니다. undefined·비유한 수·순환 참조·클래스 인스턴스·고립 surrogate는 거부합니다. 게임 필드 선택·스키마 검증·권위와 표현의 분리는 Adapter 책임입니다.
+
+기본 한도는 16 MiB/깊이 128/값과 key 1,000,000개입니다. 잘림·여분 바이트·중복/비정렬 key·비정규 수·잘못된 UTF-8·초과 한도는 decode에서 거부합니다. 선택 JSON도 정규 bytes만 허용하므로 외부 JSON 문자열은 먼저 파싱해 encode해야 합니다. 형식 변경은 byte hash를 변경하므로 실제 게임 비교에는 복원 값과 최종 결과를 사용하세요. 성능/용량 개선은 게임 상태에 따라 달라지며 코덱만으로 개선을 보장하지 않습니다.
+
+이 API는 PR 후보에만 있습니다. 현재 공개 Pages에 API가 추가됐다고 가정하지 마세요. 콘텐츠 해시 경로의 준비와 실제 공개 배포는 별도이며 쿼리스트링은 버전을 고정하지 않습니다.
+
+바이너리의 반복 문자열은 payload 내부 dictionary를 사용합니다. 최초 문자열만 UTF-8 literal로 기록하고 이후 같은 필드 이름/문자열 값은 최소 varuint 인덱스로 참조합니다. dictionary는 payload마다 새로 생성하므로 이전 encode/decode 호출이나 전역 cache 상태가 bytes에 영향을 주지 않습니다. 등록 순서는 정규 순회 순서이고, 중복 literal·미등록 참조·비최소 참조는 거부합니다.
