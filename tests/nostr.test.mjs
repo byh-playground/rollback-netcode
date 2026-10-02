@@ -102,6 +102,18 @@ async function signedEvent({
   return event;
 }
 
+test('signature verification has a shared receive budget across relays and rotating public keys',async t=>{
+  const harness=mockRelays(),receiver=await createMock(t,harness,{relays:['wss://one.test','wss://two.test'],maxVerificationsPerSecond:1,verificationBurst:1});
+  const delivered=[];receiver.subscribe(event=>delivered.push(event));
+  const events=[];for(let i=3;i<7;i++){const secret=new Uint8Array(32);secret[31]=i;events.push(await signedEvent({secret}))}
+  for(const [index,event]of events.entries()){const socket=harness.sockets[index%2];socket.message(['EVENT',socket.subscription,event])}
+  await until(()=>receiver.metrics.verified===1);
+  assert.equal(delivered.length,1);assert.equal(receiver.metrics.attempted,1);assert.equal(receiver.metrics.throttled,3);
+  assert.ok(receiver.metrics.totalVerificationMs>0);
+  await pause(1050);harness.sockets[0].message(['EVENT',harness.sockets[0].subscription,events[1]]);
+  await until(()=>receiver.metrics.verified===2);assert.equal(delivered.length,2);
+});
+
 test('BIP340 official 32-byte-message vectors: public keys, signatures, valid and invalid verification', async () => {
   // Verbatim conformance data from the official bitcoin/bips repository:
   // https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv

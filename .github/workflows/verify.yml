@@ -20,6 +20,7 @@ jobs:
           package-manager-cache: false
       - name: Check the single-file consumer runtime
         run: |
+          node scripts/build.mjs --check
           node --check rollback-netcode.js
           node --input-type=module -e "import { readFileSync } from 'node:fs'; import assert from 'node:assert/strict'; const source = readFileSync('rollback-netcode.js', 'utf8'); assert(!/^\s*import\s|\bimport\s*\(|^\s*export\s+(?:\*|\{)[^;]*\bfrom\s/m.test(source), 'Runtime must not import dependencies'); const api = await import('./rollback-netcode.js'); assert.equal(typeof api.createSession, 'function'); assert.equal(typeof api.createNostrRoom, 'function');"
       - name: Run risk-based tests

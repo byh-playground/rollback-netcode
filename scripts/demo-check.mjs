@@ -156,6 +156,11 @@ try {
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(base);
   await checkKoreanGuide(page);
+  await page.locator('#debug summary').click();
+  await page.click('#synctest');
+  await page.waitForFunction(()=>document.querySelector('#replay-result').dataset.result==='synctest-passed');
+  assert.match(await page.locator('#replay-result').textContent(),/결정론 검사 통과/);
+  await page.locator('#debug summary').click();
   for (const profile of ['action', 'rts', 'lockstep']) {
     const initial = await startLocal(page, profile);
     // Native keyboard events exercise the tutorial's A-player movement.
@@ -207,6 +212,15 @@ try {
   assert.ok(layout.document <= layout.viewport && layout.body <= layout.viewport, `390px layout must not overflow: ${JSON.stringify(layout)}`);
   await page.screenshot({ path: resolve(resultsDirectory, 'demo-ko-mobile.png'), fullPage: true });
   await assertNoErrors(page, pageErrors);
+  await page.evaluate(()=>window.__demoRtc.connections.find(peer=>peer.connectionState==='connected').close());
+  await page.waitForFunction(()=>{
+    try{return JSON.parse(document.querySelector('#debug-state').textContent).peers.every(peer=>peer.status==='disconnected')}
+    catch{return false}
+  },null,{timeout});
+  const stoppedTicks=(await readState(page)).peers.map(peer=>peer.tick);
+  await page.waitForTimeout(300);
+  assert.deepEqual((await readState(page)).peers.map(peer=>peer.tick),stoppedTicks,'Native connection closure stops logical advancement');
+  report.disconnect={actualNativeClose:true,ticks:stoppedTicks,state:'disconnected'};
   await stopLocal(page);
   report.mobile = { ...layout, screenshot: 'test-results/demo-ko-mobile.png' };
   report.passed = true;

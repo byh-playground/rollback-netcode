@@ -32,3 +32,15 @@ test('state hashing has a known byte-level result and respects view boundaries',
   const storage = new Uint8Array([9, 104, 101, 108, 108, 111, 8]);
   assert.equal(hashBytes(storage.subarray(1, 6)), 0x4f9f2cab);
 });
+
+test('fixed-point multiplication fast path agrees with exact BigInt across boundaries and randomized operands',()=>{
+  const values=[-2147483648,-2147483647,-94906266,-65537,-1025,-1024,-1,-0,0,1,1023,1024,65537,94906266,2147483647];
+  const random=new SeededPRNG(719),pairs=values.flatMap(a=>values.map(b=>[a,b]));
+  for(let i=0;i<20000;i++)pairs.push([random.nextUint32()|0,(i%2?random.nextUint32()%65537:random.nextUint32())|0]);
+  for(const [a,b]of pairs){
+    const exact=BigInt(a)*BigInt(b)/1024n;
+    if(exact< -2147483648n||exact>2147483647n)assert.throws(()=>fixedPoint.mul(a,b),RangeError);
+    else assert.equal(fixedPoint.mul(a,b),Number(exact));
+  }
+  assert.equal(Object.is(fixedPoint.mul(-1,1),-0),false);
+});
