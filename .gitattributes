@@ -1,1 +1,3 @@
 * text=auto eol=lf
+rollback-netcode.js text eol=lf
+versions/**/rollback-netcode.js text eol=lf

@@ -144,3 +144,5 @@ node scripts/live-room-check.mjs
 Node와 Playwright는 기여자 검사 도구이며 소비자 실행 의존성이 아닙니다. 타입 변경은 `tsc --noEmit --strict --lib ES2022,DOM --module nodenext --moduleResolution nodenext tests/types.test.ts`로 확인합니다. CI는 단일 배포 모듈과 src/의 일치·공개 API·기본 회귀를 검사합니다.
 
 현재 결과와 미검증 범위는 [검증 기록](docs/verification.md), 작업 운영은 [AGENTS.md](AGENTS.md)를 참고하세요.
+
+실제 게임 비용은 선택적 `scripts/rally-benchmark.mjs`로 분리 측정합니다. `RALLY_HTML`에 Adapter가 있는 RALLY FRONTIER HTML, `RALLY_REPO`에 그 Git 저장소를 지정합니다. `RALLY_PAIRED=1`은 같은 프레임에서 실행 순서를 번갈아 비교하며 게임 step·Adapter save·Core와 연결부의 잔여 비용을 따로 기록합니다. 외부 게임 저장소는 라이브러리 소비자/기본 CI의 의존성이 아닙니다.

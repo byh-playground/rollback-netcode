@@ -23,12 +23,15 @@ test('silence transitions interrupt -> timeout once, rejects invalid/replayed ke
   const p=pair({profile:{peerInterruptMs:300,peerTimeoutMs:800}});
   try{
     p.drive(8);assert.ok(p.sessions.every(s=>s.ready));
-    const old=p.queue.at(-1);p.setDelivery(false);p.pump(350);
+    const old=p.queue.findLast(packet=>packet.to===0);assert.ok(old);
+    p.sessions[0].receive('b',old.data);const lastReceived=p.sessions[0].getPeerState('b').lastReceivedAt;
+    p.setDelivery(false);p.pump(350);
     assert.equal(p.sessions[0].status,'interrupted');const before=p.sessions[0].tick;
     assert.equal(p.sessions[0].advance(new Uint8Array([1])).status,'interrupted');assert.equal(p.sessions[0].tick,before);
     for(let i=0;i<8;i++){
       p.sessions[0].receive('b',new Uint8Array([1,2,3]));
-      if(old?.to===0)p.sessions[0].receive('b',old.data);
+      p.sessions[0].receive('b',old.data);
+      assert.equal(p.sessions[0].getPeerState('b').lastReceivedAt,lastReceived);
       p.pump(100);
     }
     assert.equal(p.sessions[0].status,'disconnected');assert.equal(p.events[0].filter(e=>e.type==='peer-timeout').length,1);
