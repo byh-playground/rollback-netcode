@@ -1,0 +1,1556 @@
+/**
+ * Dependency-free browser ES module. Development contract and API: README.md.
+ * Is-a: input synchronization session. Has-a: adapter, histories and policies.
+ * Can-be: lockstep or rollback, selected by capabilities/profile, never genre subclasses.
+ */
+export const VERSION = '0.1.0-dev';
+export const PROTOCOL_VERSION = 1;
+export const CHUNK_SIZE = 16384;
+export const MAX_TICK = 0x7ffffffe; // Signed ACK fields reserve -1 for no confirmed input.
+
+const defaults = {
+  tickRate: 60, baseInputDelayTicks: 2, minInputDelayTicks: 0, maxInputDelayTicks: 8,
+  rollbackWindowTicks: 12, stateHistorySize: 64, predictionPolicy: 'hold',
+  stallPolicy: 'wait', tickDriftThreshold: 2, pacingPolicy: 'hold',
+  checksumInterval: 30, resimulationBudget: 24, maxCatchupSteps: 4,
+  adaptiveInputDelay: true, heartbeatMs: 100, adaptationIntervalMs: 1000,
+  maxSnapshotBytes: 4 * 1024 * 1024, maxHistoryBytes: 64 * 1024 * 1024, maxReplayBytes: 64 * 1024 * 1024,
+  maxCommandBytes: 2048, maxPendingCommands: 256, maxQueuedBytes: 5 * 1024 * 1024,
+  recoveryTimeoutMs: 10000, maxRecoveryAttempts: 3,
+};
+export const profiles = Object.freeze({
+  action: Object.freeze({ ...defaults }),
+  rts: Object.freeze({ ...defaults, tickRate: 20, baseInputDelayTicks: 4,
+    maxInputDelayTicks: 12, rollbackWindowTicks: 6, stateHistorySize: 32,
+    predictionPolicy: 'neutral', checksumInterval: 20, resimulationBudget: 12 }),
+  lockstep: Object.freeze({ ...defaults, rollbackWindowTicks: 0,
+    stateHistorySize: 32, predictionPolicy: 'neutral' }),
+});
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const nowMs = () => globalThis.performance?.now() ?? Date.now();
+const compareIds = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+function integer(value, name, min = 0, max = 0xffffffff) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) throw new RangeError(name);
+  return value;
+}
+function bytes(value, name = 'bytes') {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError(`${name} must be Uint8Array or ArrayBuffer`);
+}
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+export function hashBytes(value, seed = 2166136261) {
+  let h = seed >>> 0;
+  for (const b of bytes(value)) h = Math.imul(h ^ b, 16777619) >>> 0;
+  return h;
+}
+export function statelessRandom(seed, eventId) {
+  let x = (seed ^ Math.imul(integer(eventId, 'eventId'), 0x9e3779b9)) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+  x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+  return (x ^ (x >>> 16)) >>> 0;
+}
+export class SeededPRNG {
+  constructor(seed = 1) { this.state = integer(seed, 'seed') >>> 0; }
+  nextUint32() {
+    this.state = (this.state + 0x6d2b79f5) >>> 0;
+    let t = this.state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return (t ^ (t >>> 14)) >>> 0;
+  }
+  nextInt(bound) {
+    integer(bound, 'bound', 1, 0x100000000);
+    const limit = Math.floor(0x100000000 / bound) * bound;
+    let x;
+    do { x = this.nextUint32(); } while (x >= limit);
+    return x % bound;
+  }
+}
+const signed = (x) => integer(x, 'fixed-point result', -2147483648, 2147483647);
+export const fixedPoint = Object.freeze({
+  scale: 1024,
+  fromNumber: (x) => signed(Math.round(x * 1024)),
+  toNumber: (x) => signed(x) / 1024,
+  add: (a, b) => signed(signed(a) + signed(b)),
+  sub: (a, b) => signed(signed(a) - signed(b)),
+  mul: (a, b) => signed(Number(BigInt(signed(a)) * BigInt(signed(b)) / 1024n)),
+  div: (a, b) => {
+    if (signed(b) === 0) throw new RangeError('fixed-point division by zero');
+    return signed(Number(BigInt(signed(a)) * 1024n / BigInt(b)));
+  },
+});
+
+// Gameplay packets use explicitly defined little-endian fields, not JS object serialization.
+const MAGIC = 0x314b4252;
+const TYPE = Object.freeze({ HELLO: 1, INPUT: 2, CLOCK: 3, HASH: 4,
+  REQUEST: 5, BEGIN: 6, CHUNK: 7 });
+const HEADER = 12;
+const SNAP_CHUNK_BYTES = CHUNK_SIZE - HEADER - 8;
+class Writer {
+  constructor(size = CHUNK_SIZE) { this.data = new Uint8Array(size); this.view = new DataView(this.data.buffer); this.offset = 0; }
+  room(n) { if (this.offset + n > this.data.length) throw new RangeError('packet capacity'); }
+  u8(n) { this.room(1); this.view.setUint8(this.offset++, n); }
+  u16(n) { this.room(2); this.view.setUint16(this.offset, n, true); this.offset += 2; }
+  u32(n) { this.room(4); this.view.setUint32(this.offset, n, true); this.offset += 4; }
+  i32(n) { this.room(4); this.view.setInt32(this.offset, n, true); this.offset += 4; }
+  raw(b) { this.room(b.length); this.data.set(b, this.offset); this.offset += b.length; }
+  finish() { return this.data.slice(0, this.offset); }
+}
+class Reader {
+  constructor(data) { this.data = bytes(data); this.view = new DataView(this.data.buffer, this.data.byteOffset, this.data.byteLength); this.offset = 0; }
+  room(n) { if (this.offset + n > this.data.length) throw new RangeError('truncated packet'); }
+  u8() { this.room(1); return this.view.getUint8(this.offset++); }
+  u16() { this.room(2); const n = this.view.getUint16(this.offset, true); this.offset += 2; return n; }
+  u32() { this.room(4); const n = this.view.getUint32(this.offset, true); this.offset += 4; return n; }
+  i32() { this.room(4); const n = this.view.getInt32(this.offset, true); this.offset += 4; return n; }
+  raw(n) { this.room(n); const b = this.data.slice(this.offset, this.offset + n); this.offset += n; return b; }
+  end() { if (this.offset !== this.data.length) throw new RangeError('trailing packet bytes'); }
+}
+function packet(type, sequence, write) {
+  const w = new Writer();
+  w.u32(MAGIC); w.u8(PROTOCOL_VERSION); w.u8(type); w.u16(0); w.u32(sequence);
+  write(w);
+  return w.finish();
+}
+function frameEqual(a, b) {
+  if (!equalBytes(a.input, b.input) || a.commands.length !== b.commands.length) return false;
+  return a.commands.every((c, i) => c.sequence === b.commands[i].sequence && equalBytes(c.payload, b.commands[i].payload));
+}
+function copyFrame(frame) {
+  return { input: frame.input.slice(), commands: frame.commands.map(c => ({ ...c, payload: c.payload.slice() })) };
+}
+function profileOf(profile) {
+  const p = { ...defaults, ...profile };
+  for (const field of ['tickRate', 'stateHistorySize', 'checksumInterval', 'resimulationBudget', 'maxCatchupSteps',
+    'heartbeatMs', 'adaptationIntervalMs', 'maxSnapshotBytes', 'maxHistoryBytes', 'maxReplayBytes', 'maxCommandBytes',
+    'maxPendingCommands', 'maxQueuedBytes', 'recoveryTimeoutMs', 'maxRecoveryAttempts']) integer(p[field], field, 1, 0x7fffffff);
+  for (const field of ['baseInputDelayTicks', 'minInputDelayTicks', 'maxInputDelayTicks', 'rollbackWindowTicks', 'tickDriftThreshold']) integer(p[field], field, 0, 65535);
+  if (p.minInputDelayTicks > p.baseInputDelayTicks || p.baseInputDelayTicks > p.maxInputDelayTicks) throw new RangeError('input delay bounds');
+  if (p.stateHistorySize < p.rollbackWindowTicks + 2) throw new RangeError('stateHistorySize must exceed rollback window by two');
+  if (p.stateHistorySize > 8192) throw new RangeError('stateHistorySize capacity (8192)');
+  if (p.tickRate > 240 || p.maxCommandBytes > CHUNK_SIZE - 1024 || p.maxSnapshotBytes > 64 * 1024 * 1024) throw new RangeError('profile size limit');
+  if (!['hold', 'neutral'].includes(p.predictionPolicy) && typeof p.predictionPolicy !== 'function') throw new TypeError('predictionPolicy');
+  if (!['none', 'hold', 'dilation'].includes(p.pacingPolicy) || p.stallPolicy !== 'wait') throw new TypeError('pacing/stall policy');
+  return Object.freeze(p);
+}
+class StateHistory {
+  constructor(size, maxBytes = 64 * 1024 * 1024) { this.slots = new Array(size); this.size = size; this.maxBytes = maxBytes; this.byteLength = 0; }
+  get(tick) { const s = this.slots[tick % this.size]; return s?.tick === tick ? s : undefined; }
+  put(state) {
+    const i = state.tick % this.size, next = this.byteLength - (this.slots[i]?.bytes.length ?? 0) + state.bytes.length;
+    if (next > this.maxBytes) throw new RangeError('state history byte budget');
+    this.slots[i] = state; this.byteLength = next;
+  }
+  invalidateAfter(tick) {
+    for (let i = 0; i < this.size; i++) if (this.slots[i]?.tick > tick) { this.byteLength -= this.slots[i].bytes.length; this.slots[i] = undefined; }
+  }
+}
+
+export function createSession(options) { return new RollbackSession(options); }
+export class RollbackSession {
+  constructor({ players, localPlayerId, sessionId, simulationVersion, seed = 1, inputSize,
+    profile = profiles.action, adapter, authorityPlayerId, onEvent = () => {}, recordReplay = true, clock = nowMs } = {}) {
+    if (!Array.isArray(players) || players.length < 1 || players.length > 8 ||
+      players.some(p => typeof p !== 'string' || !p.length || p.length > 128) || new Set(players).size !== players.length) throw new TypeError('fixed player roster (1..8 unique IDs)');
+    this.players = Object.freeze([...players].sort(compareIds));
+    if (!this.players.includes(localPlayerId)) throw new TypeError('localPlayerId');
+    if (typeof sessionId !== 'string' || !sessionId.length || sessionId.length > 128 || typeof simulationVersion !== 'string' || !simulationVersion.length || simulationVersion.length > 128) throw new TypeError('sessionId/simulationVersion');
+    if (!adapter || ['save', 'load', 'step', 'validateSnapshot'].some(n => typeof adapter[n] !== 'function')) throw new TypeError('Simulation Adapter must save, load, step, validateSnapshot');
+    this.localPlayerId = localPlayerId; this.sessionId = sessionId; this.simulationVersion = simulationVersion;
+    this.seed = integer(seed, 'seed'); this.inputSize = integer(inputSize, 'inputSize', 1, 1024);
+    if (typeof clock !== 'function') throw new TypeError('monotonic runtime clock');
+    this._clock = clock;
+    this.profile = profileOf(profile); this.adapter = adapter; this.onEvent = onEvent;
+    this.authorityPlayerId = authorityPlayerId ?? this.players[0];
+    if (!this.players.includes(this.authorityPlayerId)) throw new TypeError('authorityPlayerId');
+    this._tick = 0; this._inputDelay = this.profile.baseInputDelayTicks; this.closed = false;
+    this._history = new StateHistory(this.profile.stateHistorySize, this.profile.maxHistoryBytes);
+    this._inputs = new Map(this.players.map(p => [p, new Map()]));
+    this._through = new Map(this.players.map(p => [p, -1]));
+    this._used = new Map(); this._peers = new Map(); this._pendingCommands = [];
+    this._commandSequence = 0; this._sequence = 0; this._captureTick = -1;
+    this._lastLocalInput = new Uint8Array(this.inputSize);
+    this._rollbackFrom = Infinity; this._resimTarget = null; this._inputHash = 2166136261;
+    this._lastHashTick = -1; this._nextTransfer = 0; this._recoveryAttempts = 0;
+    this._incomingSnapshot = null; this._requestedRecovery = null; this._recoveryStage = null;
+    this._lastAdaptation = null; this._stableWindows = 0; this._pace = 1;
+    this._window = { advances: 0, received: 0, late: 0, depth: 0, rollback: 0, stall: 0, cost: 0, costSamples: 0 };
+    this._metrics = { rollbacks: 0, resimulatedTicks: 0, maxRollbackDepth: 0, stalls: 0, holds: 0,
+      recoveries: 0, rejectedSnapshots: 0, rejectedPackets: 0, sentBytes: 0, receivedBytes: 0,
+      predictedTicks: 0, hashMismatches: 0, latestResimulationMs: 0, smoothedRTT: 0, jitter: 0,
+      lateInputRate: 0, rollbackFrequency: 0, stallFrequency: 0, resimulationCostMs: 0 };
+    this._recordReplay = recordReplay; this._replayFrames = []; this._replayBytes = 0; this._replayFinalHash = undefined;
+    const initial = this._save();
+    this._initialState = initial.slice();
+    this._history.put({ tick: 0, bytes: initial, hash: hashBytes(initial), inputHash: this._inputHash });
+    this._hello = encoder.encode(JSON.stringify({ protocol: PROTOCOL_VERSION, library: VERSION, sessionId,
+      simulationVersion, seed, players: this.players, tickRate: this.profile.tickRate, inputSize,
+      authorityPlayerId: this.authorityPlayerId, initialHash: hashBytes(initial) }));
+    for (let t = 0; t < this.inputDelay; t++) this._commitLocal(t, this._lastLocalInput, []);
+  }
+  get tick() { return this._tick; }
+  get inputDelay() { return this._inputDelay; }
+  get confirmedTick() { return Math.min(...this._through.values()); }
+  get resimulating() { return this._resimTarget !== null || this._rollbackFrom !== Infinity || this._recoveryStage !== null; }
+  get ready() { return this.players.every(p => p === this.localPlayerId || this._peers.get(p)?.ready); }
+  get metrics() { return { ...this._metrics, inputDelay: this.inputDelay, confirmedTick: this.confirmedTick, tick: this.tick, pace: this._pace }; }
+  _event(type, detail = {}) { try { this.onEvent({ type, tick: this.tick, ...detail }); } catch { /* Observers cannot change the protocol. */ } }
+  _save() {
+    const state = bytes(this.adapter.save(), 'snapshot').slice();
+    if (!state.length || state.length > this.profile.maxSnapshotBytes) throw new RangeError('snapshot size');
+    return state;
+  }
+  _nextSequence() { this._sequence = (this._sequence + 1) >>> 0; return this._sequence; }
+  attachTransport(peerId, transport) {
+    if (this.closed) throw new Error('session closed');
+    if (peerId === this.localPlayerId || !this.players.includes(peerId) || this._peers.has(peerId)) throw new TypeError('peerId already attached or outside roster');
+    if (typeof transport?.send !== 'function' || typeof transport.subscribe !== 'function') throw new TypeError('Transport capability: send and subscribe');
+    const peer = { id: peerId, transport, ready: false, ack: -1, tick: 0, confirmed: -1,
+      clockSequence: null, clockAt: 0, lastSent: -Infinity, lastHello: -Infinity,
+      pendingPings: new Map(), echo: 0, rtt: 0, jitter: 0, hashes: new Map(),
+      controls: [], queuedBytes: 0, lastHashQueued: 0, unsubscribe: null };
+    this._peers.set(peerId, peer);
+    peer.unsubscribe = transport.subscribe(data => this.receive(peerId, data));
+    this._sendHello(peer, this._clock());
+    return () => { peer.unsubscribe?.(); this._peers.delete(peerId); };
+  }
+  _send(peer, data) {
+    try {
+      if (peer.transport.send(data) === false) return false;
+      this._metrics.sentBytes += data.length; return true;
+    } catch (error) { this._event('transport-error', { peerId: peer.id, error }); return false; }
+  }
+  _sendHello(peer, now) {
+    if (this._send(peer, packet(TYPE.HELLO, this._nextSequence(), w => w.raw(this._hello)))) peer.lastHello = now;
+  }
+  _queue(peer, data) {
+    if (peer.queuedBytes + data.length > this.profile.maxQueuedBytes) return false;
+    peer.controls.push(data); peer.queuedBytes += data.length; return true;
+  }
+  _commitLocal(tick, input, commands) {
+    integer(tick, 'session tick limit', 0, MAX_TICK);
+    const frame = { input: input.slice(), commands };
+    if (this._inputs.get(this.localPlayerId).has(tick)) throw new Error('committed input is immutable');
+    this._inputs.get(this.localPlayerId).set(tick, frame);
+    this._through.set(this.localPlayerId, tick);
+  }
+  queueCommand(payload) {
+    if (this.closed) throw new Error('session closed');
+    const b = bytes(payload).slice();
+    if (!b.length || b.length > this.profile.maxCommandBytes || this._pendingCommands.length >= this.profile.maxPendingCommands) throw new RangeError('command capacity');
+    integer(this._commandSequence + 1, 'command sequence', 1);
+    const sequence = ++this._commandSequence;
+    this._pendingCommands.push({ sequence, payload: b }); return sequence;
+  }
+  setInputDelay(ticks) {
+    integer(ticks, 'input delay', this.profile.minInputDelayTicks, this.profile.maxInputDelayTicks);
+    if (ticks !== this.inputDelay) { const previous = this.inputDelay; this._inputDelay = ticks; this._event('input-delay', { previous, value: ticks }); }
+  }
+  _capture(input) {
+    const b = bytes(input);
+    if (b.length !== this.inputSize) throw new RangeError('inputSize');
+    const previous = this._inputs.get(this.localPlayerId).get(this._through.get(this.localPlayerId))?.input ?? this._lastLocalInput;
+    this._lastLocalInput = b.slice();
+    if (this._captureTick === this.tick) return;
+    this._captureTick = this.tick;
+    const target = integer(this.tick + this.inputDelay, 'session tick limit', 0, MAX_TICK);
+    const through = this._through.get(this.localPlayerId);
+    // Delay reduction omits sampled held state until the old future prefix drains.
+    // Pending one-shot commands remain queued, never copied/dropped or retimed.
+    if (target <= through) return;
+    for (let t = through + 1; t < target; t++) this._commitLocal(t, previous, []);
+    let budget = CHUNK_SIZE - 1024 - this.inputSize;
+    const commands = [];
+    while (this._pendingCommands.length && this._pendingCommands[0].payload.length + 6 <= budget) {
+      const c = this._pendingCommands.shift(); budget -= c.payload.length + 6;
+      commands.push({ ...c, executeTick: target });
+    }
+    this._commitLocal(target, this._lastLocalInput, commands);
+  }
+  releaseInput() {
+    if (this.closed) return;
+    this._lastLocalInput = new Uint8Array(this.inputSize);
+    const last = this._inputs.get(this.localPlayerId).get(this._through.get(this.localPlayerId));
+    if (last && equalBytes(last.input, this._lastLocalInput)) {
+      for (const peer of this._peers.values()) if (peer.ready) this._sendInputs(peer);
+      return;
+    }
+    const target = integer(Math.max(this.tick + this.inputDelay, this._through.get(this.localPlayerId) + 1), 'session tick limit', 0, MAX_TICK);
+    for (let t = this._through.get(this.localPlayerId) + 1; t <= target; t++) this._commitLocal(t, this._lastLocalInput, []);
+    for (const peer of this._peers.values()) if (peer.ready) this._sendInputs(peer);
+    this._event('input-release', { executeTick: target });
+  }
+  _sendInputs(peer) {
+    const map = this._inputs.get(this.localPlayerId);
+    const first = peer.ack + 1;
+    if (!map.has(first)) return;
+    const frames = [];
+    let cost = HEADER + 16;
+    for (let t = first; frames.length < 128 && map.has(t); t++) {
+      const f = map.get(t);
+      const n = 7 + this.inputSize + f.commands.reduce((s, c) => s + 6 + c.payload.length, 0);
+      if (cost + n > CHUNK_SIZE) break;
+      frames.push(f); cost += n;
+    }
+    if (!frames.length) return;
+    this._send(peer, packet(TYPE.INPUT, this._nextSequence(), w => {
+      w.u32(first); w.u16(frames.length); w.u16(this.inputSize); w.i32(this._through.get(peer.id)); w.u32(this.tick);
+      for (let i = 0; i < frames.length;) {
+        const f = frames[i]; let run = 1;
+        while (i + run < frames.length && !frames[i + run].commands.length && equalBytes(f.input, frames[i + run].input)) run++;
+        w.u16(run); w.raw(f.input); w.u16(f.commands.length);
+        for (const c of f.commands) { w.u32(c.sequence); w.u16(c.payload.length); w.raw(c.payload); }
+        i += run;
+      }
+    }));
+  }
+  _sendClock(peer, now, replyTo) {
+    const id = this._nextSequence();
+    const data = packet(TYPE.CLOCK, id, w => {
+      w.u32(this.tick); w.i32(this.confirmedTick); w.i32(this._through.get(peer.id)); w.u32(replyTo ?? 0); w.u8(replyTo === undefined ? 0 : 1);
+    });
+    if (this._send(peer, data)) {
+      if (replyTo === undefined) { peer.pendingPings.set(id, now); peer.lastSent = now; }
+      while (peer.pendingPings.size > 32) peer.pendingPings.delete(peer.pendingPings.keys().next().value);
+    }
+  }
+  poll(now = this._clock()) {
+    if (this.closed) return;
+    if (!Number.isFinite(now)) throw new TypeError('network time');
+    for (const peer of this._peers.values()) {
+      if (!peer.ready) { if (now - peer.lastHello >= this.profile.heartbeatMs) this._sendHello(peer, now); continue; }
+      if (now - peer.lastSent >= this.profile.heartbeatMs) { this._sendInputs(peer); this._sendClock(peer, now); }
+      let sent = 0;
+      while (peer.controls.length && sent < 65536) {
+        const data = peer.controls[0]; if (!this._send(peer, data)) break;
+        peer.controls.shift(); peer.queuedBytes -= data.length; sent += data.length;
+      }
+    }
+    if (this._incomingSnapshot && now - this._incomingSnapshot.started > this.profile.recoveryTimeoutMs) this._rejectSnapshot('snapshot timeout');
+    if (this._requestedRecovery && now - this._requestedRecovery.at > this.profile.recoveryTimeoutMs) {
+      if (this._recoveryStage) this._rejectSnapshot('candidate replay timeout');
+      else this._requestedRecovery = null;
+      this._event('recovery-timeout');
+    }
+    // Reconciliation must finish even when gameplay is paused at a terminal tick.
+    // It consumes a bounded resimulation budget, never a new logical tick.
+    if (this._recoveryStage) this._continueRecovery();
+    else if (this.resimulating) this._rollback();
+    this._adapt(now); this._sendHashes(); this._checkHashes(); this._recordConfirmed();
+  }
+  receive(peerId, data, now = this._clock()) {
+    if (this.closed) return false;
+    const peer = this._peers.get(peerId);
+    if (!peer) return false;
+    try {
+      const b = bytes(data);
+      if (b.length < HEADER || b.length > CHUNK_SIZE) throw new RangeError('packet size');
+      const r = new Reader(b);
+      if (r.u32() !== MAGIC || r.u8() !== PROTOCOL_VERSION) throw new Error('protocol version');
+      const type = r.u8(); if (r.u16() !== 0) throw new Error('reserved header');
+      const sequence = r.u32();
+      this._metrics.receivedBytes += b.length;
+      if (type === TYPE.HELLO) {
+        const hello = r.raw(b.length - HEADER); r.end();
+        if (!equalBytes(hello, this._hello)) throw new Error('session/simulation/roster/seed/version/initial-state mismatch');
+        const wasReady = peer.ready; peer.ready = true;
+        if (!wasReady) { this._sendHello(peer, now); this._event('peer-ready', { peerId }); }
+        return true;
+      }
+      if (!peer.ready) return false;
+      if (type === TYPE.INPUT) this._receiveInputs(peer, r, sequence, now);
+      else if (type === TYPE.CLOCK) this._receiveClock(peer, r, sequence, now);
+      else if (type === TYPE.HASH) {
+        const tick = r.u32(), hash = r.u32(), inputHash = r.u32(); r.end();
+        if (tick <= this.tick + this.profile.stateHistorySize && tick >= Math.max(0, this.tick - this.profile.stateHistorySize + 1)) peer.hashes.set(tick, { hash, inputHash });
+      } else if (type === TYPE.REQUEST) {
+        const tick = r.u32(); r.end(); this._sendSnapshot(peer, tick);
+      } else if (type === TYPE.BEGIN) this._beginSnapshot(peer, r, now);
+      else if (type === TYPE.CHUNK) this._snapshotChunk(peer, r);
+      else throw new Error('unknown packet type');
+      return true;
+    } catch (error) {
+      this._metrics.rejectedPackets++; this._event('protocol-error', { peerId, error }); return false;
+    }
+  }
+  _receiveInputs(peer, r, sequence, now) {
+    const first = r.u32(), count = r.u16(), size = r.u16(), ack = r.i32(), simTick = r.u32();
+    if (!count || count > 128 || size !== this.inputSize || first + count - 1 > MAX_TICK || first + count > this.tick + this.profile.stateHistorySize * 4 + this.profile.maxInputDelayTicks + 1) throw new RangeError('input timeline');
+    if (ack < -1 || ack > this._through.get(this.localPlayerId)) throw new RangeError('ack');
+    const incoming = [];
+    while (incoming.length < count) {
+      const run = r.u16(); if (!run || incoming.length + run > count) throw new RangeError('input run');
+      const input = r.raw(size), n = r.u16(), commands = [];
+      if (n > this.profile.maxPendingCommands) throw new RangeError('command count');
+      let previous = 0;
+      for (let i = 0; i < n; i++) {
+        const sequence = r.u32(), len = r.u16();
+        if (!sequence || sequence <= previous || !len || len > this.profile.maxCommandBytes) throw new RangeError('command shape/order');
+        previous = sequence; commands.push({ sequence, executeTick: first + incoming.length, payload: r.raw(len) });
+      }
+      incoming.push({ input, commands });
+      for (let j = 1; j < run; j++) incoming.push({ input: input.slice(), commands: [] });
+    }
+    r.end();
+    const map = this._inputs.get(peer.id);
+    // Validate the complete packet before publishing any portion of it.
+    for (let i = 0; i < count; i++) {
+      const old = map.get(first + i); if (old && !frameEqual(old, incoming[i])) throw new Error('conflicting committed input');
+    }
+    peer.ack = Math.max(peer.ack, ack);
+    if (peer.progressSequence === undefined || ((sequence - peer.progressSequence) >>> 0) < 0x80000000 && sequence !== peer.progressSequence) {
+      peer.progressSequence = sequence; peer.tick = simTick; peer.clockAt = now;
+    }
+    const oldest = Math.max(0, this.tick - this.profile.stateHistorySize + 1);
+    for (let i = 0; i < count; i++) {
+      const t = first + i;
+      if (map.has(t) || t < oldest) continue;
+      map.set(t, incoming[i]);
+      this._window.received++;
+      if (t < this.tick) this._window.late++;
+      const used = this._used.get(t)?.find(x => x.playerId === peer.id);
+      if (used && t < this.tick && !frameEqual(used, incoming[i])) {
+        if (this._recoveryStage) this._rejectSnapshot('input history changed during candidate replay');
+        if (!this._history.get(t)) { this._event('history-exhausted', { inputTick: t }); this.requestResync(Math.min(this.confirmedTick + 1, this.tick)); }
+        else this._rollbackFrom = Math.min(this._rollbackFrom, t);
+      }
+    }
+    let through = this._through.get(peer.id);
+    while (map.has(through + 1)) through++;
+    this._through.set(peer.id, through);
+  }
+  _receiveClock(peer, r, sequence, now) {
+    const tick = r.u32(), confirmed = r.i32(), ack = r.i32(), echo = r.u32(), reply = r.u8(); r.end();
+    if (reply > 1) throw new RangeError('clock reply flag');
+    if (tick > MAX_TICK + 1 || confirmed < -1 || confirmed > ack || ack < -1 || ack > this._through.get(this.localPlayerId)) throw new RangeError('clock/ack');
+    const fresh = peer.clockSequence === null || ((sequence - peer.clockSequence) >>> 0) < 0x80000000 && sequence !== peer.clockSequence;
+    if (!fresh) return;
+    peer.clockSequence = sequence; peer.confirmed = confirmed;
+    if (peer.progressSequence === undefined || ((sequence - peer.progressSequence) >>> 0) < 0x80000000 && sequence !== peer.progressSequence) {
+      peer.progressSequence = sequence; peer.tick = tick; peer.clockAt = now;
+    }
+    peer.ack = Math.max(peer.ack, ack); peer.echo = sequence;
+    if (!reply) this._sendClock(peer, now, sequence);
+    const sent = reply ? peer.pendingPings.get(echo) : undefined;
+    if (sent !== undefined && now >= sent) {
+      const sample = now - sent; peer.pendingPings.delete(echo);
+      const difference = Math.abs(sample - peer.rtt);
+      peer.rtt = peer.rtt ? peer.rtt * .875 + sample * .125 : sample;
+      peer.jitter = peer.jitter * .75 + (peer.rtt === sample ? 0 : difference * .25);
+      this._metrics.smoothedRTT = Math.max(...[...this._peers.values()].map(p => p.rtt));
+      this._metrics.jitter = Math.max(...[...this._peers.values()].map(p => p.jitter));
+    }
+  }
+  _resolve(tick) {
+    return this.players.map(playerId => {
+      const map = this._inputs.get(playerId), actual = map.get(tick);
+      if (actual) return { playerId, ...copyFrame(actual), predicted: false };
+      let prior = this._used.get(tick - 1)?.find(f => f.playerId === playerId)?.input ?? new Uint8Array(this.inputSize);
+      const policy = this.profile.predictionPolicy;
+      if (typeof policy === 'function') prior = bytes(policy({ playerId, tick, previousInput: prior.slice(), lastConfirmedTick: this._through.get(playerId) }));
+      else if (policy === 'neutral') prior = new Uint8Array(this.inputSize);
+      if (prior.length !== this.inputSize) throw new RangeError('predictor inputSize');
+      // Only continuous state is predicted; a missing one-shot command is never repeated.
+      return { playerId, input: prior.slice(), commands: [], predicted: true };
+    });
+  }
+  _step(inputs, resimulating) {
+    const before = this._history.get(this.tick);
+    const tick = this.tick;
+    integer(tick, 'session tick limit', 0, MAX_TICK);
+    try {
+      this.adapter.step({ tick, tickRate: this.profile.tickRate,
+        inputs: inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })), resimulating });
+      const w = new Writer(CHUNK_SIZE * this.players.length);
+      w.u32(tick);
+      for (const f of inputs) {
+        w.raw(f.input); w.u16(f.commands.length);
+        for (const c of f.commands) { w.u32(c.sequence); w.u16(c.payload.length); w.raw(c.payload); }
+      }
+      const inputHash = hashBytes(w.finish(), this._inputHash);
+      const state = this._save();
+      this._history.put({ tick: tick + 1, bytes: state, hash: hashBytes(state), inputHash });
+      this._used.set(tick, inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })));
+      this._tick++; this._inputHash = inputHash;
+    } catch (error) {
+      if (before) this.adapter.load(before.bytes.slice());
+      this._event('fatal', { error }); throw error;
+    }
+  }
+  _rollback() {
+    const started = nowMs();
+    if (this._rollbackFrom !== Infinity) {
+      const target = this._resimTarget ?? this.tick, from = this._rollbackFrom;
+      const saved = this._history.get(from);
+      if (!saved) throw new Error('rollback state expired');
+      this.adapter.load(saved.bytes.slice()); this._tick = from; this._inputHash = saved.inputHash;
+      this._history.invalidateAfter(from); this._rollbackFrom = Infinity; this._resimTarget = target;
+      this._metrics.rollbacks++; this._window.rollback++;
+      this._metrics.maxRollbackDepth = Math.max(this._metrics.maxRollbackDepth, target - from);
+      this._window.depth = Math.max(this._window.depth, target - from);
+      this._event('rollback', { from, target });
+    }
+    let work = 0;
+    while (this._resimTarget !== null && this.tick < this._resimTarget && work < this.profile.resimulationBudget) {
+      this._step(this._resolve(this.tick), true); work++; this._metrics.resimulatedTicks++;
+    }
+    if (this._resimTarget !== null && this.tick === this._resimTarget) this._resimTarget = null;
+    this._metrics.latestResimulationMs = nowMs() - started;
+    this._window.cost += this._metrics.latestResimulationMs;
+    this._window.costSamples++;
+    return this._resimTarget === null;
+  }
+  _frameAdvantage(now) {
+    let advantage = -Infinity;
+    for (const peer of this._peers.values()) if (peer.ready && peer.clockSequence !== null) {
+      // Remote reports are samples. Extrapolation is deliberately capped on stale data.
+      const age = Math.max(0, Math.min(1000 / this.profile.tickRate, now - peer.clockAt));
+      const estimated = peer.tick + (age + peer.rtt / 2) * this.profile.tickRate / 1000;
+      advantage = Math.max(advantage, this.tick - estimated);
+    }
+    return Number.isFinite(advantage) ? advantage : 0;
+  }
+  advance(input = this._lastLocalInput) {
+    if (this.closed) throw new Error('session closed');
+    const now = this._clock(); this.poll(now);
+    if (this.resimulating) return { status: 'resimulating', tick: this.tick };
+    this._capture(input);
+    for (const peer of this._peers.values()) if (peer.ready) this._sendInputs(peer);
+    if (!this.ready) return { status: 'synchronizing', tick: this.tick };
+    const advantage = this._frameAdvantage(now);
+    const threshold = this.profile.tickDriftThreshold;
+    const hold = this.profile.pacingPolicy === 'hold' && advantage > threshold ||
+      this.profile.pacingPolicy === 'dilation' && advantage > Math.max(4, threshold * 3);
+    if (hold) { this._metrics.holds++; return { status: 'held', tick: this.tick }; }
+    const inputs = this._resolve(this.tick), predicted = inputs.some(f => f.predicted);
+    const minAck = this._peers.size ? Math.min(...[...this._peers.values()].map(p => p.ack)) : this.tick;
+    if (predicted && this.tick - (this.confirmedTick + 1) >= this.profile.rollbackWindowTicks ||
+      this._through.get(this.localPlayerId) - minAck >= this.profile.stateHistorySize * 4) {
+      this._metrics.stalls++; this._window.stall++; return { status: 'stalled', tick: this.tick };
+    }
+    this._step(inputs, false); this._window.advances++;
+    if (predicted) this._metrics.predictedTicks++;
+    this._recordConfirmed(); this._sendHashes(); this._checkHashes(); this._prune();
+    return { status: 'advanced', tick: this.tick };
+  }
+  _adapt(now) {
+    if (this._lastAdaptation === null) { this._lastAdaptation = now; return; }
+    if (now - this._lastAdaptation < this.profile.adaptationIntervalMs) return;
+    const seconds = (now - this._lastAdaptation) / 1000;
+    this._lastAdaptation = now;
+    const w = this._window;
+    const lateRate = w.received ? w.late / w.received : 0;
+    this._metrics.lateInputRate = this._metrics.lateInputRate * .75 + lateRate * .25;
+    this._metrics.rollbackFrequency = this._metrics.rollbackFrequency * .75 + w.rollback / seconds * .25;
+    this._metrics.stallFrequency = this._metrics.stallFrequency * .75 + w.stall / seconds * .25;
+    const cost = w.costSamples ? w.cost / w.costSamples : 0;
+    this._metrics.resimulationCostMs = this._metrics.resimulationCostMs * .75 + cost * .25;
+    if (this.profile.adaptiveInputDelay) {
+      const measured = Math.ceil((this._metrics.smoothedRTT / 2 + 2 * this._metrics.jitter) * this.profile.tickRate / 1000);
+      const pressure = this._metrics.lateInputRate > .1 || this._metrics.rollbackFrequency > 2 ||
+        w.depth > 3 || this._metrics.stallFrequency > 2 || this._metrics.resimulationCostMs > 1000 / this.profile.tickRate;
+      if (pressure || measured > this.inputDelay + 1) {
+        this.setInputDelay(Math.min(this.profile.maxInputDelayTicks, this.inputDelay + 1)); this._stableWindows = 0;
+      } else if (w.advances > 0 && !w.late && !w.stall && measured <= this.inputDelay - 1) {
+        if (++this._stableWindows >= 3) { this.setInputDelay(Math.max(this.profile.minInputDelayTicks, this.inputDelay - 1)); this._stableWindows = 0; }
+      } else this._stableWindows = 0;
+    }
+    if (this.profile.pacingPolicy === 'dilation') {
+      const drift = this._frameAdvantage(now);
+      const target = Math.abs(drift) < .5 ? 1 : Math.max(.98, Math.min(1.05, 1 + drift * .005));
+      const change = Math.max(-.005, Math.min(.005, (target - this._pace) * .2));
+      this._pace = Math.max(.98, Math.min(1.05, this._pace + change));
+    }
+    this._window = { advances: 0, received: 0, late: 0, depth: 0, rollback: 0, stall: 0, cost: 0, costSamples: 0 };
+  }
+  _sendHashes() {
+    if (this.resimulating) return;
+    const upTo = Math.min(this.tick, this.confirmedTick + 1);
+    const t = Math.floor(upTo / this.profile.checksumInterval) * this.profile.checksumInterval;
+    if (!t) return;
+    const s = this._history.get(t); if (!s) return;
+    for (const peer of this._peers.values()) if (peer.ready && peer.lastHashQueued < t) {
+      // Coalesce congestion into the newest retained confirmed boundary.
+      // Unsent hashes remain derivable from the ring instead of an unbounded queue.
+      if (this._queue(peer, packet(TYPE.HASH, this._nextSequence(), w => { w.u32(t); w.u32(s.hash); w.u32(s.inputHash); }))) peer.lastHashQueued = t;
+    }
+  }
+  _checkHashes() {
+    if (this.resimulating) return;
+    for (const peer of this._peers.values()) for (const [tick, remote] of peer.hashes) {
+      if (tick > Math.min(this.tick, this.confirmedTick + 1)) continue;
+      const local = this._history.get(tick);
+      if (!local) { peer.hashes.delete(tick); continue; }
+      if (local.inputHash !== remote.inputHash) { peer.hashes.delete(tick); this._event('input-history-mismatch', { peerId: peer.id, at: tick }); continue; }
+      if (local.hash !== remote.hash) {
+        if (!remote.notified) { remote.notified = true; this._metrics.hashMismatches++; this._event('desync', { peerId: peer.id, at: tick }); }
+        if (this.localPlayerId === this.authorityPlayerId || this.requestResync(tick)) peer.hashes.delete(tick);
+      } else peer.hashes.delete(tick);
+    }
+  }
+  getStateHash(tick = this.tick) { return this._history.get(tick)?.hash; }
+  requestResync(tick) {
+    integer(tick, 'recovery tick', 0, Math.min(this.tick, this.confirmedTick + 1));
+    if (this.localPlayerId === this.authorityPlayerId) return false;
+    const peer = this._peers.get(this.authorityPlayerId);
+    if (!peer?.ready || this._requestedRecovery || this._recoveryAttempts >= this.profile.maxRecoveryAttempts) return false;
+    const state = this._history.get(tick); if (!state) return false;
+    if (!this._queue(peer, packet(TYPE.REQUEST, this._nextSequence(), w => w.u32(tick)))) return false;
+    this._requestedRecovery = { tick, inputHash: state.inputHash, at: this._clock() };
+    this._recoveryAttempts++; return true;
+  }
+  _sendSnapshot(peer, tick) {
+    if (this.localPlayerId !== this.authorityPlayerId || this.resimulating || tick > this.confirmedTick + 1) return;
+    const state = this._history.get(tick); if (!state) return;
+    const transfer = (++this._nextTransfer) >>> 0, count = Math.ceil(state.bytes.length / SNAP_CHUNK_BYTES);
+    const packets = [packet(TYPE.BEGIN, this._nextSequence(), w => {
+      w.u32(transfer); w.u32(tick); w.u32(state.bytes.length); w.u32(state.hash); w.u32(state.inputHash); w.u16(count);
+    })];
+    for (let i = 0; i < count; i++) packets.push(packet(TYPE.CHUNK, this._nextSequence(), w => {
+      w.u32(transfer); w.u32(i); w.raw(state.bytes.subarray(i * SNAP_CHUNK_BYTES, (i + 1) * SNAP_CHUNK_BYTES));
+    }));
+    if (peer.queuedBytes + packets.reduce((s, b) => s + b.length, 0) > this.profile.maxQueuedBytes) { this._event('recovery-backpressure', { peerId: peer.id }); return; }
+    for (const p of packets) this._queue(peer, p);
+  }
+  _beginSnapshot(peer, r, now) {
+    const transfer = r.u32(), tick = r.u32(), total = r.u32(), hash = r.u32(), inputHash = r.u32(), count = r.u16(); r.end();
+    const busy = this._recoveryStage?.candidate ?? this._incomingSnapshot;
+    if (busy) {
+      if (peer.id === this.authorityPlayerId && transfer === busy.transfer && tick === busy.tick && total === busy.total && hash === busy.hash && inputHash === busy.inputHash && count === busy.count) return;
+      throw new Error('another snapshot candidate is active');
+    }
+    if (peer.id !== this.authorityPlayerId || !this._requestedRecovery || this._requestedRecovery.tick !== tick ||
+      inputHash !== this._requestedRecovery.inputHash || !this._history.get(tick) || tick > this.confirmedTick + 1 ||
+      !total || total > this.profile.maxSnapshotBytes || count !== Math.ceil(total / SNAP_CHUNK_BYTES) || this._incomingSnapshot) throw new Error('snapshot candidate metadata');
+    this._incomingSnapshot = { transfer, tick, total, hash, inputHash, count, bytes: new Uint8Array(total),
+      seen: new Uint8Array(count), received: 0, started: now };
+  }
+  _snapshotChunk(peer, r) {
+    const transfer = r.u32(), index = r.u32(), candidate = this._incomingSnapshot;
+    if (peer.id !== this.authorityPlayerId || !candidate || transfer !== candidate.transfer || index >= candidate.count) throw new Error('snapshot transfer');
+    const chunk = r.raw(r.data.length - r.offset); r.end();
+    const expected = Math.min(SNAP_CHUNK_BYTES, candidate.total - index * SNAP_CHUNK_BYTES);
+    if (chunk.length !== expected) throw new RangeError('snapshot chunk length');
+    const start = index * SNAP_CHUNK_BYTES;
+    if (candidate.seen[index]) {
+      if (!equalBytes(candidate.bytes.subarray(start, start + expected), chunk)) throw new Error('conflicting snapshot chunk');
+      return;
+    }
+    candidate.bytes.set(chunk, start); candidate.seen[index] = 1; candidate.received++;
+    if (candidate.received === candidate.count) this._commitSnapshot(candidate);
+  }
+  _rejectSnapshot(reason) {
+    this._incomingSnapshot = null; this._requestedRecovery = null; this._recoveryStage = null;
+    this._metrics.rejectedSnapshots++; this._event('recovery-rejected', { reason });
+  }
+  _commitSnapshot(candidate) {
+    if (this.resimulating || !this._history.get(candidate.tick) || hashBytes(candidate.bytes) !== candidate.hash) { this._rejectSnapshot('expired or corrupt candidate'); return; }
+    const original = this._save();
+    try {
+      if (this.adapter.validateSnapshot(candidate.bytes.slice(), { tick: candidate.tick }) !== true) throw new Error('adapter rejected candidate');
+      this.adapter.load(candidate.bytes.slice());
+      if (!equalBytes(this._save(), candidate.bytes)) throw new Error('snapshot round-trip changed candidate');
+      this._recoveryStage = { candidate, original, current: this.tick, next: candidate.tick,
+        inputHash: candidate.inputHash, state: candidate.bytes.slice(), staged: [], stagedInputs: [], stageBytes: 0 };
+      this._incomingSnapshot = null;
+    } catch (error) { this._rejectSnapshot(error.message); }
+    finally { this.adapter.load(original); }
+  }
+  _continueRecovery() {
+    const job = this._recoveryStage;
+    if (!job) return;
+    const started = nowMs();
+    try {
+      this.adapter.load(job.state.slice());
+      let work = 0;
+      while (job.next < job.current && work < this.profile.resimulationBudget) {
+        const t = job.next, inputs = this._resolve(t);
+        this.adapter.step({ tick: t, tickRate: this.profile.tickRate,
+          inputs: inputs.map(f => ({ ...copyFrame(f), playerId: f.playerId, predicted: f.predicted })),
+          resimulating: true, recovering: true });
+        const w = new Writer(CHUNK_SIZE * this.players.length); w.u32(t);
+        for (const f of inputs) {
+          w.raw(f.input); w.u16(f.commands.length);
+          for (const c of f.commands) { w.u32(c.sequence); w.u16(c.payload.length); w.raw(c.payload); }
+        }
+        job.inputHash = hashBytes(w.finish(), job.inputHash);
+        job.state = this._save();
+        job.staged.push({ tick: t + 1, bytes: job.state, hash: hashBytes(job.state), inputHash: job.inputHash });
+        job.stagedInputs.push([t, inputs]); job.next++; work++; this._metrics.resimulatedTicks++;
+        job.stageBytes += job.state.length;
+        if (job.stageBytes > this.profile.maxHistoryBytes) throw new RangeError('candidate replay byte budget');
+      }
+      if (job.next < job.current) { this.adapter.load(job.original.slice()); return; }
+      // Construct a complete replacement ring before exposing either game or runtime state.
+      const replacement = new StateHistory(this.profile.stateHistorySize, this.profile.maxHistoryBytes);
+      for (const state of this._history.slots) if (state && state.tick < job.candidate.tick) replacement.put(state);
+      replacement.put({ tick: job.candidate.tick, bytes: job.candidate.bytes,
+        hash: job.candidate.hash, inputHash: job.candidate.inputHash });
+      for (const state of job.staged) replacement.put(state);
+      const used = new Map(this._used);
+      for (const [t, inputs] of job.stagedInputs) used.set(t, inputs);
+      this._history = replacement; this._used = used; this._inputHash = job.inputHash;
+      this._recoveryStage = null; this._requestedRecovery = null;
+      this._recoveryAttempts = 0;
+      this._metrics.recoveries++;
+      this._event('recovered', { from: job.candidate.tick, target: job.current });
+    } catch (error) {
+      this.adapter.load(job.original.slice());
+      this._rejectSnapshot(error.message);
+    } finally {
+      this._metrics.latestResimulationMs = nowMs() - started;
+      this._window.cost += this._metrics.latestResimulationMs;
+      this._window.costSamples++;
+    }
+  }
+  _recordConfirmed() {
+    if (!this._recordReplay || this.resimulating) return;
+    const through = Math.min(this.confirmedTick, this.tick - 1);
+    for (let t = this._replayFrames.length; t <= through; t++) {
+      const inputs = this.players.map(playerId => ({ playerId, ...copyFrame(this._inputs.get(playerId).get(t)), predicted: false }));
+      const n = inputs.reduce((s, f) => s + f.input.length + f.commands.reduce((k, c) => k + c.payload.length + 12, 0), 16);
+      if (this._replayBytes + n > this.profile.maxReplayBytes) { this._recordReplay = false; this._event('replay-capacity'); return; }
+      this._replayFrames.push({ tick: t, inputs }); this._replayBytes += n;
+      this._replayFinalHash = this._history.get(t + 1)?.hash;
+    }
+  }
+  exportReplay() {
+    if (this.resimulating) throw new Error('finish rollback before exporting replay');
+    this._recordConfirmed();
+    const tick = this._replayFrames.length;
+    return { version: VERSION, simulationVersion: this.simulationVersion, seed: this.seed,
+      players: [...this.players], inputSize: this.inputSize, tickRate: this.profile.tickRate,
+      initialState: this._initialState.slice(), frames: this._replayFrames.map(f => ({ tick: f.tick,
+        inputs: f.inputs.map(x => ({ ...copyFrame(x), playerId: x.playerId, predicted: false })) })),
+      tick, hash: this._history.get(tick)?.hash ?? this._replayFinalHash ?? hashBytes(this._initialState),
+      truncated: !this._recordReplay };
+  }
+  _prune() {
+    const oldest = Math.max(0, this.tick - this.profile.stateHistorySize + 1);
+    for (const t of this._used.keys()) if (t < oldest - 1) this._used.delete(t);
+    const minAck = this._peers.size ? Math.min(...[...this._peers.values()].map(p => p.ack)) : this.tick;
+    for (const [playerId, map] of this._inputs) for (const t of map.keys()) if (t < oldest && (playerId !== this.localPlayerId || t <= minAck)) map.delete(t);
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const peer of this._peers.values()) { peer.unsubscribe?.(); peer.transport.close?.(); }
+    this._peers.clear(); this._incomingSnapshot = null; this._recoveryStage = null; this._pendingCommands.length = 0; this._event('closed');
+  }
+}
+
+export function playReplay({ adapter, replay, simulationVersion = replay?.simulationVersion } = {}) {
+  if (replay?.version !== VERSION || replay.simulationVersion !== simulationVersion || !Array.isArray(replay.frames)) throw new Error('replay compatibility');
+  adapter.load(bytes(replay.initialState).slice());
+  let tick = 0;
+  for (const f of replay.frames) {
+    if (f.tick !== tick) throw new Error('non-contiguous replay');
+    adapter.step({ tick, tickRate: replay.tickRate, inputs: f.inputs.map(x => ({ ...copyFrame(x), playerId: x.playerId, predicted: false })), resimulating: true, replaying: true }); tick++;
+  }
+  return { tick, hash: hashBytes(bytes(adapter.save())) };
+}
+
+/** Transport capability adapter. Channel reliability is independent of ordering. */
+export class WebRTCTransport {
+  constructor({ inputChannel, controlChannel, highWaterMark = 262144, lowWaterMark = 65536 } = {}) {
+    if (!controlChannel || typeof controlChannel.send !== 'function') throw new TypeError('controlChannel');
+    integer(highWaterMark, 'highWaterMark', CHUNK_SIZE, 16 * 1024 * 1024);
+    integer(lowWaterMark, 'lowWaterMark', 0, highWaterMark);
+    this.inputChannel = inputChannel ?? controlChannel; this.controlChannel = controlChannel;
+    this.highWaterMark = highWaterMark; this.listeners = new Set(); this.closed = false;
+    this.channels = [...new Set([this.inputChannel, this.controlChannel])];
+    this._onMessage = async event => {
+      if (this.closed) return;
+      let data = event.data;
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        if (data.size > CHUNK_SIZE) return;
+        data = await data.arrayBuffer();
+      }
+      if (this.closed) return;
+      try {
+        const b = bytes(data);
+        if (b.length > CHUNK_SIZE) return;
+        for (const listener of this.listeners) listener(b.slice());
+      } catch { /* Malformed external messages are not JS evaluation. */ }
+    };
+    for (const channel of this.channels) {
+      channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = lowWaterMark;
+      channel.addEventListener('message', this._onMessage);
+    }
+  }
+  get bufferedAmount() { return this.channels.reduce((n, c) => n + c.bufferedAmount, 0); }
+  send(data) {
+    const b = bytes(data);
+    if (b.length > CHUNK_SIZE) throw new RangeError('DataChannel chunk size');
+    const type = b.length >= HEADER ? b[5] : 0;
+    const channel = type === TYPE.INPUT || type === TYPE.CLOCK ? this.inputChannel : this.controlChannel;
+    if (this.closed || channel.readyState !== 'open' || this.bufferedAmount + b.length > this.highWaterMark) return false;
+    try { channel.send(b); return true; }
+    catch (error) { if (error.name === 'OperationError' || error.name === 'InvalidStateError') return false; throw error; }
+  }
+  subscribe(handler) {
+    if (this.closed || typeof handler !== 'function') throw new TypeError('transport subscriber');
+    this.listeners.add(handler); return () => this.listeners.delete(handler);
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const channel of this.channels) { channel.removeEventListener('message', this._onMessage); channel.close(); }
+    this.listeners.clear();
+  }
+}
+
+const DEFAULT_ICE = Object.freeze([{ urls: 'stun:stun.l.google.com:19302' }]);
+/** Signaler is-a routing adapter: send(to,message), subscribe(handler), id. */
+export function createWebRTCPeer({ initiator = false, signaler, remoteId,
+  rtcConfig = { iceServers: DEFAULT_ICE }, timeoutMs = 20000,
+  RTCPeerConnectionImpl = globalThis.RTCPeerConnection, onStatus = () => {}, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(new Error('connection aborted'));
+  if (typeof RTCPeerConnectionImpl !== 'function' || typeof signaler?.send !== 'function' || typeof signaler.subscribe !== 'function' || !remoteId) return Promise.reject(new TypeError('WebRTC and Signaler capabilities required'));
+  // Explicit opt-in is required for caller supplied TURN; defaults contain STUN only.
+  let pc;
+  try { integer(timeoutMs, 'timeoutMs', 1, 120000); pc = new RTCPeerConnectionImpl(rtcConfig); }
+  catch (error) { return Promise.reject(error); }
+  let inputChannel, controlChannel, transport, unsubscribe, timer, disposed = false, settled = false;
+  let chain = Promise.resolve(); const earlyIce = [], iceBatch = []; let iceTimer;
+  const status = value => { try { onStatus(value); } catch { /* Observer only. */ } };
+  let resolve, reject;
+  const result = new Promise((yes, no) => { resolve = yes; reject = no; });
+  const close = () => {
+    if (disposed) return;
+    disposed = true; clearTimeout(timer); clearTimeout(iceTimer); unsubscribe?.(); signal?.removeEventListener('abort', close); transport?.close(); pc.close();
+    if (!settled) { settled = true; reject(new Error('WebRTC connection closed')); }
+  };
+  const fail = error => { status({ type: 'connection-error', error }); if (!settled) { settled = true; reject(error); } close(); };
+  signal?.addEventListener('abort', close, { once: true });
+  const send = message => Promise.resolve(signaler.send(remoteId, message));
+  const maybeReady = () => {
+    if (disposed || settled || inputChannel?.readyState !== 'open' || controlChannel?.readyState !== 'open') return;
+    clearTimeout(timer); settled = true; transport = new WebRTCTransport({ inputChannel, controlChannel });
+    status({ type: 'connected' }); resolve({ transport, peerConnection: pc, close });
+  };
+  const channel = value => {
+    if (value.label === 'inputs' && !inputChannel) inputChannel = value;
+    else if (value.label === 'control' && !controlChannel) controlChannel = value;
+    else { value.close(); return; }
+    value.addEventListener('open', maybeReady); maybeReady();
+  };
+  pc.addEventListener('datachannel', event => channel(event.channel));
+  const flushCandidates = () => {
+    clearTimeout(iceTimer);
+    if (disposed || !iceBatch.length) return;
+    send({ type: 'ice', candidates: iceBatch.splice(0) }).catch(fail);
+  };
+  pc.addEventListener('icecandidate', event => {
+    if (disposed) return;
+    if (event.candidate) {
+      if (iceBatch.length >= 128) { fail(new RangeError('ICE candidate batch capacity')); return; }
+      iceBatch.push(event.candidate.toJSON()); clearTimeout(iceTimer); iceTimer = setTimeout(flushCandidates, 100);
+    } else flushCandidates();
+  });
+  pc.addEventListener('connectionstatechange', () => {
+    status({ type: 'connection-state', state: pc.connectionState });
+    if (pc.connectionState === 'failed') fail(new Error('P2P connection failed; no automatic TURN fallback'));
+  });
+  const flushIce = async () => { while (earlyIce.length) await pc.addIceCandidate(earlyIce.shift()); };
+  unsubscribe = signaler.subscribe(event => {
+    if (disposed || event.from !== remoteId || event.to !== signaler.id && event.to !== '*') return;
+    const message = event.message;
+    chain = chain.then(async () => {
+      if (disposed) return;
+      if (message?.type === 'offer' && !initiator && !pc.remoteDescription) {
+        await pc.setRemoteDescription(message.description); await flushIce();
+        await pc.setLocalDescription(await pc.createAnswer());
+        await send({ type: 'answer', description: pc.localDescription.toJSON() });
+      } else if (message?.type === 'answer' && initiator && !pc.remoteDescription) {
+        await pc.setRemoteDescription(message.description); await flushIce();
+      } else if (message?.type === 'ice') {
+        const candidates = message.candidates ?? (message.candidate ? [message.candidate] : []);
+        if (!Array.isArray(candidates) || candidates.length > 128) throw new RangeError('ICE candidate batch');
+        for (const candidate of candidates) {
+          if (pc.remoteDescription) await pc.addIceCandidate(candidate);
+          else if (earlyIce.length < 128) earlyIce.push(candidate);
+          else throw new RangeError('ICE queue capacity');
+        }
+      } else if (message?.type === 'bye') close();
+    }).catch(fail);
+  });
+  timer = setTimeout(() => fail(new Error('P2P connection timeout')), integer(timeoutMs, 'timeoutMs', 1, 120000));
+  if (initiator) {
+    channel(pc.createDataChannel('inputs', { ordered: false, maxRetransmits: 0 }));
+    channel(pc.createDataChannel('control', { ordered: true }));
+    chain = chain.then(async () => {
+      await pc.setLocalDescription(await pc.createOffer());
+      await send({ type: 'offer', description: pc.localDescription.toJSON() });
+    }).catch(fail);
+  }
+  return result;
+}
+
+/** Fixed Simulation dt, separately adjustable real-time scheduling. No import side effects. */
+export function createLoop({ session, getInput = () => new Uint8Array(session.inputSize), render = () => {},
+  onError = error => { throw error; }, onInputRelease = () => {}, requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
+  cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis) } = {}) {
+  if (!session || typeof requestFrame !== 'function' || typeof cancelFrame !== 'function') throw new TypeError('session and frame scheduler');
+  const quantum = 1000 / session.profile.tickRate;
+  let running = false, handle, last, accumulator = 0;
+  const release = () => {
+    try { onInputRelease(); session.releaseInput(); }
+    catch (error) { stop(); onError(error); }
+  };
+  const hidden = () => { if (globalThis.document?.hidden) { release(); last = undefined; accumulator = 0; } };
+  const stop = () => {
+    running = false; cancelFrame(handle);
+    globalThis.removeEventListener?.('blur', release);
+    globalThis.document?.removeEventListener('visibilitychange', hidden);
+  };
+  const frame = timestamp => {
+    if (!running) return;
+    try {
+      if (last === undefined) last = timestamp;
+      accumulator = Math.min(accumulator + Math.max(0, Math.min(250, timestamp - last)), quantum * session.profile.maxCatchupSteps);
+      last = timestamp; session.poll();
+      let work = 0;
+      while (accumulator >= quantum * session.metrics.pace && work < session.profile.maxCatchupSteps) {
+        const result = session.advance(getInput()); work++;
+        if (result.status !== 'advanced') { accumulator = Math.min(accumulator, quantum); break; }
+        accumulator -= quantum * session.metrics.pace;
+      }
+      // Rendering continues on holds. During a budgeted replay, retain the prior render bridge.
+      render({ session, alpha: Math.min(1, accumulator / quantum), resimulating: session.resimulating });
+      handle = requestFrame(frame);
+    } catch (error) { stop(); onError(error); }
+  };
+  const start = () => {
+    if (running) return;
+    running = true; last = undefined; accumulator = 0;
+    globalThis.addEventListener?.('blur', release);
+    globalThis.document?.addEventListener('visibilitychange', hidden);
+    handle = requestFrame(frame);
+  };
+  return { start, stop, get running() { return running; } };
+}
+
+/** Two-player room discovery is an optional capability, separate from the fixed-roster core. */
+export async function createNostrRoom({ role, room, namespace = 'rollback-netcode', relays,
+  rtcConfig, timeoutMs = 30000, onStatus = () => {}, signal,
+  signalerFactory = createNostrSignaler, peerFactory = createWebRTCPeer } = {}) {
+  if (!['host', 'join'].includes(role)) throw new TypeError('room role');
+  integer(timeoutMs, 'timeoutMs', 1, 120000);
+  if (typeof signalerFactory !== 'function' || typeof peerFactory !== 'function') throw new TypeError('room adapter factories');
+  if (signal?.aborted) throw new Error('room aborted');
+  if (!room && role === 'host') {
+    const value = new Uint32Array(1); globalThis.crypto.getRandomValues(value);
+    room = String(value[0] % 10000).padStart(4, '0');
+  }
+  if (!/^\d{4}$/.test(room ?? '')) throw new TypeError('four-digit room');
+  const controller = new AbortController();
+  const externalAbort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', externalAbort, { once: true });
+  const roomSignal = controller.signal;
+  let signaler;
+  try { signaler = await signalerFactory({ room, namespace, relays,
+    timeoutMs: Math.min(timeoutMs, 10000), onStatus, signal: roomSignal }); }
+  catch (error) { signal?.removeEventListener('abort', externalAbort); throw error; }
+  if (roomSignal.aborted) { signaler.close(); signal?.removeEventListener('abort', externalAbort); throw new Error('room aborted'); }
+  return new Promise((resolve, reject) => {
+    let connection, unsubscribe, pulse, deadline, collisionTimer;
+    let disposed = false, connecting = false, completed = false, selectedPeer, checking = role === 'host';
+    const nonce = new Uint8Array(16); globalThis.crypto.getRandomValues(nonce);
+    let sessionId = [...nonce].map(n => n.toString(16).padStart(2, '0')).join('');
+    const status = value => { try { onStatus(value); } catch { /* Presentation observer. */ } };
+    const close = () => {
+      if (disposed) return;
+      disposed = true; clearInterval(pulse); clearTimeout(deadline); clearTimeout(collisionTimer);
+      unsubscribe?.(); roomSignal.removeEventListener('abort', abort);
+      signal?.removeEventListener('abort', externalAbort); controller.abort(); connection?.close(); signaler.close();
+    };
+    const fail = error => { if (!completed) { completed = true; reject(error); } close(); };
+    const abort = () => fail(new Error('room aborted'));
+    roomSignal.addEventListener('abort', abort, { once: true });
+    const send = (to, message) => signaler.send(to, message).catch(fail);
+    const presence = to => send(to, { type: 'presence', room, namespace, host: signaler.id, sessionId, protocol: PROTOCOL_VERSION });
+    const connect = remoteId => {
+      if (connecting || disposed) return;
+      connecting = true; selectedPeer = remoteId;
+      Promise.resolve().then(() => peerFactory({ initiator: role === 'join', signaler, remoteId, rtcConfig,
+        timeoutMs: Math.min(timeoutMs, 20000), onStatus, signal: roomSignal })).then(value => {
+        if (disposed) { value.close(); return; }
+        connection = value; completed = true; clearInterval(pulse); clearTimeout(deadline); clearTimeout(collisionTimer);
+        unsubscribe?.();
+        resolve({ room, sessionId, localPlayerId: role === 'host' ? 'a' : 'b',
+          remotePlayerId: role === 'host' ? 'b' : 'a', transport: value.transport,
+          peerConnection: value.peerConnection, close });
+      }).catch(fail);
+    };
+    unsubscribe = signaler.subscribe(({ from, to, message }) => {
+      if (disposed || from === signaler.id) return;
+      if (role === 'host') {
+        if (message.type === 'presence' && message.host === from && message.protocol === PROTOCOL_VERSION) {
+          fail(new Error('room code is already in use; choose another four-digit code')); return;
+        }
+        if (message.type === 'discover' && !checking && (!selectedPeer || selectedPeer === from)) {
+          // Install the answer subscription before advertising to this joiner.
+          connect(from); presence(from);
+        }
+      } else if (message.type === 'presence' && message.host === from && message.protocol === PROTOCOL_VERSION && typeof message.sessionId === 'string') {
+        if (selectedPeer && selectedPeer !== from) return;
+        selectedPeer = from;
+        if (to === signaler.id) { sessionId = message.sessionId; connect(from); }
+        else send(from, { type: 'discover' });
+      }
+    });
+    if (disposed) { unsubscribe?.(); return; }
+    deadline = setTimeout(() => fail(new Error('room discovery timeout')), timeoutMs);
+    const advertise = () => {
+      if (disposed || connecting || checking) return;
+      if (role === 'host') presence('*'); else send(selectedPeer ?? '*', { type: 'discover' });
+    };
+    pulse = setInterval(advertise, 1000);
+    status({ type: 'room', room, role });
+    if (disposed) return;
+    if (checking) collisionTimer = setTimeout(() => { checking = false; advertise(); }, 1200);
+    else advertise();
+  });
+}
+
+// NIP-01/BIP340 signaling. These short-lived keys identify a signaling session,
+// never a wallet. JavaScript BigInt arithmetic is not constant-time.
+const nostrField = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn;
+const nostrOrder = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const nostrGenerator = [
+  0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n,
+  0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n,
+  1n
+];
+const nostrInfinity = [0n, 1n, 0n];
+const nostrEncoder = new TextEncoder();
+const nostrHex32 = /^[0-9a-f]{64}$/;
+const nostrHex64 = /^[0-9a-f]{128}$/;
+const nostrSignalTypes = new Set(['discover', 'presence', 'offer', 'answer', 'ice', 'bye']);
+const nostrContentLimit = 128 * 1024;
+const nostrFreshSeconds = 120;
+const nostrFutureSeconds = 30;
+
+function nostrMod(nostrValue, nostrModulus = nostrField) {
+  const nostrRemainder = nostrValue % nostrModulus;
+  return nostrRemainder < 0n ? nostrRemainder + nostrModulus : nostrRemainder;
+}
+
+function nostrPow(nostrBase, nostrExponent) {
+  let nostrResult = 1n;
+  nostrBase = nostrMod(nostrBase);
+  while (nostrExponent > 0n) {
+    if (nostrExponent & 1n) nostrResult = nostrMod(nostrResult * nostrBase);
+    nostrBase = nostrMod(nostrBase * nostrBase);
+    nostrExponent >>= 1n;
+  }
+  return nostrResult;
+}
+
+function nostrDouble(nostrPoint) {
+  const [nostrX, nostrY, nostrZ] = nostrPoint;
+  if (nostrZ === 0n || nostrY === 0n) return nostrInfinity;
+  const nostrA = nostrMod(nostrX * nostrX);
+  const nostrB = nostrMod(nostrY * nostrY);
+  const nostrC = nostrMod(nostrB * nostrB);
+  const nostrD = nostrMod(2n * (nostrMod((nostrX + nostrB) ** 2n) - nostrA - nostrC));
+  const nostrE = nostrMod(3n * nostrA);
+  const nostrNextX = nostrMod(nostrE * nostrE - 2n * nostrD);
+  return [nostrNextX, nostrMod(nostrE * (nostrD - nostrNextX) - 8n * nostrC), nostrMod(2n * nostrY * nostrZ)];
+}
+
+function nostrAdd(nostrLeft, nostrRight) {
+  if (nostrLeft[2] === 0n) return nostrRight;
+  if (nostrRight[2] === 0n) return nostrLeft;
+  const [nostrX1, nostrY1, nostrZ1] = nostrLeft;
+  const [nostrX2, nostrY2, nostrZ2] = nostrRight;
+  const nostrZ1Squared = nostrMod(nostrZ1 * nostrZ1);
+  const nostrZ2Squared = nostrMod(nostrZ2 * nostrZ2);
+  const nostrU1 = nostrMod(nostrX1 * nostrZ2Squared);
+  const nostrU2 = nostrMod(nostrX2 * nostrZ1Squared);
+  const nostrS1 = nostrMod(nostrY1 * nostrZ2Squared * nostrZ2);
+  const nostrS2 = nostrMod(nostrY2 * nostrZ1Squared * nostrZ1);
+  if (nostrU1 === nostrU2) return nostrS1 === nostrS2 ? nostrDouble(nostrLeft) : nostrInfinity;
+  const nostrH = nostrMod(nostrU2 - nostrU1);
+  const nostrI = nostrMod(4n * nostrH * nostrH);
+  const nostrJ = nostrMod(nostrH * nostrI);
+  const nostrR = nostrMod(2n * (nostrS2 - nostrS1));
+  const nostrV = nostrMod(nostrU1 * nostrI);
+  const nostrNextX = nostrMod(nostrR * nostrR - nostrJ - 2n * nostrV);
+  return [
+    nostrNextX,
+    nostrMod(nostrR * (nostrV - nostrNextX) - 2n * nostrS1 * nostrJ),
+    nostrMod(((nostrZ1 + nostrZ2) ** 2n - nostrZ1Squared - nostrZ2Squared) * nostrH)
+  ];
+}
+
+function nostrMultiply(nostrScalar, nostrPoint = nostrGenerator) {
+  let nostrResult = nostrInfinity;
+  while (nostrScalar > 0n) {
+    if (nostrScalar & 1n) nostrResult = nostrAdd(nostrResult, nostrPoint);
+    nostrPoint = nostrDouble(nostrPoint);
+    nostrScalar >>= 1n;
+  }
+  return nostrResult;
+}
+
+function nostrAffine(nostrPoint) {
+  if (nostrPoint[2] === 0n) return null;
+  const nostrInverse = nostrPow(nostrPoint[2], nostrField - 2n);
+  const nostrInverseSquared = nostrMod(nostrInverse * nostrInverse);
+  return [nostrMod(nostrPoint[0] * nostrInverseSquared), nostrMod(nostrPoint[1] * nostrInverseSquared * nostrInverse)];
+}
+
+function nostrLiftX(nostrX) {
+  if (nostrX >= nostrField) return null;
+  const nostrC = nostrMod(nostrX ** 3n + 7n);
+  const nostrY = nostrPow(nostrC, (nostrField + 1n) / 4n);
+  if (nostrMod(nostrY * nostrY) !== nostrC) return null;
+  return [nostrX, (nostrY & 1n) ? nostrField - nostrY : nostrY, 1n];
+}
+
+function nostrRequireBytes(nostrValue, nostrLength, nostrName) {
+  if (!(nostrValue instanceof Uint8Array) || nostrValue.length !== nostrLength) {
+    throw new TypeError(`${nostrName} must be a ${nostrLength}-byte Uint8Array`);
+  }
+  return new Uint8Array(nostrValue);
+}
+
+function nostrBytesToNumber(nostrBytes) {
+  let nostrValue = 0n;
+  for (const nostrByte of nostrBytes) nostrValue = (nostrValue << 8n) | BigInt(nostrByte);
+  return nostrValue;
+}
+
+function nostrNumberToBytes(nostrValue) {
+  const nostrBytes = new Uint8Array(32);
+  for (let nostrIndex = 31; nostrIndex >= 0; nostrIndex--) {
+    nostrBytes[nostrIndex] = Number(nostrValue & 255n);
+    nostrValue >>= 8n;
+  }
+  return nostrBytes;
+}
+
+function nostrToHex(nostrBytes) {
+  return Array.from(nostrBytes, nostrByte => nostrByte.toString(16).padStart(2, '0')).join('');
+}
+
+function nostrFromHex(nostrHex) {
+  return Uint8Array.from(nostrHex.match(/../g), nostrByte => parseInt(nostrByte, 16));
+}
+
+function nostrConcat(...nostrParts) {
+  const nostrBytes = new Uint8Array(nostrParts.reduce((nostrSize, nostrPart) => nostrSize + nostrPart.length, 0));
+  let nostrOffset = 0;
+  for (const nostrPart of nostrParts) {
+    nostrBytes.set(nostrPart, nostrOffset);
+    nostrOffset += nostrPart.length;
+  }
+  return nostrBytes;
+}
+
+function nostrRequireCrypto(nostrCryptoImpl, nostrRandom = false) {
+  if (!nostrCryptoImpl?.subtle || typeof nostrCryptoImpl.subtle.digest !== 'function' ||
+      (nostrRandom && typeof nostrCryptoImpl.getRandomValues !== 'function')) {
+    throw new Error('Nostr signaling requires WebCrypto SHA-256 and secure randomness (use HTTPS)');
+  }
+}
+
+async function nostrHash(nostrBytes, nostrCryptoImpl) {
+  nostrRequireCrypto(nostrCryptoImpl);
+  return new Uint8Array(await nostrCryptoImpl.subtle.digest('SHA-256', nostrBytes));
+}
+
+async function nostrTaggedHash(nostrTag, nostrBytes, nostrCryptoImpl) {
+  const nostrTagHash = await nostrHash(nostrEncoder.encode(nostrTag), nostrCryptoImpl);
+  return nostrHash(nostrConcat(nostrTagHash, nostrTagHash, nostrBytes), nostrCryptoImpl);
+}
+
+function nostrPublicKey(nostrSecret) {
+  const nostrSecretCopy = nostrRequireBytes(nostrSecret, 32, 'secret');
+  try {
+    const nostrScalar = nostrBytesToNumber(nostrSecretCopy);
+    if (nostrScalar === 0n || nostrScalar >= nostrOrder) throw new RangeError('Invalid secp256k1 secret');
+    return nostrNumberToBytes(nostrAffine(nostrMultiply(nostrScalar))[0]);
+  } finally {
+    nostrSecretCopy.fill(0);
+  }
+}
+
+async function nostrVerify(nostrSignature, nostrMessage, nostrPublic, nostrCryptoImpl) {
+  if (!(nostrSignature instanceof Uint8Array) || nostrSignature.length !== 64 ||
+      !(nostrMessage instanceof Uint8Array) || nostrMessage.length !== 32 ||
+      !(nostrPublic instanceof Uint8Array) || nostrPublic.length !== 32) return false;
+  const nostrSignatureCopy = new Uint8Array(nostrSignature);
+  const nostrMessageCopy = new Uint8Array(nostrMessage);
+  const nostrPublicCopy = new Uint8Array(nostrPublic);
+  const nostrPoint = nostrLiftX(nostrBytesToNumber(nostrPublicCopy));
+  const nostrR = nostrBytesToNumber(nostrSignatureCopy.subarray(0, 32));
+  const nostrS = nostrBytesToNumber(nostrSignatureCopy.subarray(32));
+  if (!nostrPoint || nostrR >= nostrField || nostrS >= nostrOrder) return false;
+  const nostrChallenge = nostrBytesToNumber(await nostrTaggedHash('BIP0340/challenge',
+    nostrConcat(nostrSignatureCopy.subarray(0, 32), nostrPublicCopy, nostrMessageCopy), nostrCryptoImpl)) % nostrOrder;
+  const nostrResult = nostrAffine(nostrAdd(nostrMultiply(nostrS), nostrMultiply(nostrChallenge,
+    [nostrPoint[0], nostrMod(-nostrPoint[1]), 1n])));
+  return nostrResult !== null && (nostrResult[1] & 1n) === 0n && nostrResult[0] === nostrR;
+}
+
+async function nostrSign(nostrMessage, nostrSecret, nostrAuxiliary, nostrCryptoImpl) {
+  const nostrMessageCopy = nostrRequireBytes(nostrMessage, 32, 'message');
+  const nostrAuxiliaryCopy = nostrRequireBytes(nostrAuxiliary, 32, 'auxiliary randomness');
+  const nostrSecretCopy = nostrRequireBytes(nostrSecret, 32, 'secret');
+  let nostrMaskedSecret;
+  try {
+    const nostrScalar = nostrBytesToNumber(nostrSecretCopy);
+    if (nostrScalar === 0n || nostrScalar >= nostrOrder) throw new RangeError('Invalid secp256k1 secret');
+    const nostrPoint = nostrAffine(nostrMultiply(nostrScalar));
+    const nostrNormalizedSecret = (nostrPoint[1] & 1n) ? nostrOrder - nostrScalar : nostrScalar;
+    const nostrPublic = nostrNumberToBytes(nostrPoint[0]);
+    const nostrAuxiliaryHash = await nostrTaggedHash('BIP0340/aux', nostrAuxiliaryCopy, nostrCryptoImpl);
+    nostrMaskedSecret = nostrNumberToBytes(nostrNormalizedSecret);
+    for (let nostrIndex = 0; nostrIndex < 32; nostrIndex++) nostrMaskedSecret[nostrIndex] ^= nostrAuxiliaryHash[nostrIndex];
+    const nostrNonce = nostrBytesToNumber(await nostrTaggedHash('BIP0340/nonce',
+      nostrConcat(nostrMaskedSecret, nostrPublic, nostrMessageCopy), nostrCryptoImpl)) % nostrOrder;
+    if (nostrNonce === 0n) throw new Error('BIP340 nonce generation failed');
+    const nostrNoncePoint = nostrAffine(nostrMultiply(nostrNonce));
+    const nostrNormalizedNonce = (nostrNoncePoint[1] & 1n) ? nostrOrder - nostrNonce : nostrNonce;
+    const nostrR = nostrNumberToBytes(nostrNoncePoint[0]);
+    const nostrChallenge = nostrBytesToNumber(await nostrTaggedHash('BIP0340/challenge',
+      nostrConcat(nostrR, nostrPublic, nostrMessageCopy), nostrCryptoImpl)) % nostrOrder;
+    const nostrSignature = nostrConcat(nostrR, nostrNumberToBytes(nostrMod(nostrNormalizedNonce + nostrChallenge * nostrNormalizedSecret, nostrOrder)));
+    if (!await nostrVerify(nostrSignature, nostrMessageCopy, nostrPublic, nostrCryptoImpl)) throw new Error('BIP340 signature self-check failed');
+    return nostrSignature;
+  } finally {
+    nostrSecretCopy.fill(0);
+    nostrAuxiliaryCopy.fill(0);
+    nostrMaskedSecret?.fill(0);
+  }
+}
+
+/** Low-level 32-byte-message helpers for conformance tests, not wallet signing. */
+export const nostrCrypto = Object.freeze({
+  publicKey: nostrPublicKey,
+  sign: (nostrMessage, nostrSecret, nostrAuxiliary) => nostrSign(nostrMessage, nostrSecret, nostrAuxiliary, globalThis.crypto),
+  verify: (nostrSignature, nostrMessage, nostrPublic) => nostrVerify(nostrSignature, nostrMessage, nostrPublic, globalThis.crypto)
+});
+
+function nostrIsSignalMessage(nostrMessage) {
+  return nostrMessage !== null && typeof nostrMessage === 'object' && !Array.isArray(nostrMessage) &&
+    Object.prototype.hasOwnProperty.call(nostrMessage, 'type') && nostrSignalTypes.has(nostrMessage.type);
+}
+
+function nostrListen(nostrSocket, nostrType, nostrHandler) {
+  if (typeof nostrSocket.addEventListener === 'function') {
+    nostrSocket.addEventListener(nostrType, nostrHandler);
+    return () => nostrSocket.removeEventListener(nostrType, nostrHandler);
+  }
+  const nostrProperty = `on${nostrType}`;
+  nostrSocket[nostrProperty] = nostrHandler;
+  return () => { if (nostrSocket[nostrProperty] === nostrHandler) nostrSocket[nostrProperty] = null; };
+}
+
+/** Public-relay discovery/SDP/ICE only. Game input and state belong on WebRTC. */
+export async function createNostrSignaler({
+  room,
+  namespace = 'rollback-netcode',
+  relays = ['wss://relay.primal.net', 'wss://relay.damus.io'],
+  timeoutMs = 10000,
+  onStatus = () => {},
+  WebSocketImpl = globalThis.WebSocket,
+  cryptoImpl = globalThis.crypto,
+  signal,
+  publishIntervalMs = 500
+} = {}) {
+  if (signal?.aborted) throw new Error('Nostr signaler aborted');
+  if (typeof room !== 'string' || !/^\d{4}$/.test(room)) throw new TypeError('room must contain exactly four ASCII digits');
+  if (typeof namespace !== 'string' || namespace.trim().length === 0 || nostrEncoder.encode(namespace).length > 128) throw new TypeError('namespace must be a nonempty string of at most 128 UTF-8 bytes');
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120000) throw new RangeError('timeoutMs must be greater than zero and at most 120000');
+  integer(publishIntervalMs, 'publishIntervalMs', 0, 10000);
+  if (typeof WebSocketImpl !== 'function') throw new Error('Nostr signaling requires WebSocket support');
+  if (typeof onStatus !== 'function') throw new TypeError('onStatus must be a function');
+  nostrRequireCrypto(cryptoImpl, true);
+  if (!Array.isArray(relays) || relays.length === 0 || relays.length > 16) throw new TypeError('relays must contain between 1 and 16 WebSocket URLs');
+  const nostrUrls = [...new Set(relays.map(nostrRelay => {
+    if (typeof nostrRelay !== 'string') throw new TypeError('Relay URLs must be strings');
+    const nostrUrl = new URL(nostrRelay);
+    if (!['ws:', 'wss:'].includes(nostrUrl.protocol) || nostrUrl.username || nostrUrl.password || nostrUrl.hash) throw new TypeError('Relays must be ws:// or wss:// URLs without credentials or fragments');
+    return nostrUrl.href;
+  }))];
+  const nostrRandom = nostrLength => cryptoImpl.getRandomValues(new Uint8Array(nostrLength));
+  const nostrSecret = new Uint8Array(32);
+  let nostrSecretReady = false;
+  for (let nostrAttempt = 0; nostrAttempt < 16; nostrAttempt++) {
+    nostrSecret.set(nostrRandom(32));
+    const nostrValue = nostrBytesToNumber(nostrSecret);
+    if (nostrValue > 0n && nostrValue < nostrOrder) { nostrSecretReady = true; break; }
+  }
+  if (!nostrSecretReady) { nostrSecret.fill(0); throw new Error('Secure random secret generation failed'); }
+  const nostrId = nostrToHex(nostrPublicKey(nostrSecret));
+  const nostrRoomTag = `${namespace}:${room}`;
+  const nostrSubscription = `rn-${nostrToHex(nostrRandom(16))}`;
+  const nostrListeners = new Set();
+  const nostrBacklog = [];
+  const nostrSeen = new Map();
+  const nostrVerifying = new Set();
+  const nostrPending = new Map();
+  const nostrStates = [];
+  let nostrClosed = false;
+  let nostrSending = 0;
+  let nostrSendTail = Promise.resolve(), nostrLastPublication = -Infinity;
+  const nostrWaiters = new Map();
+  let nostrHasSubscriber = false;
+  let nostrReadyResolve;
+  let nostrReadyReject;
+  let nostrInitializationSettled = false;
+  const nostrReady = new Promise((nostrResolve, nostrReject) => { nostrReadyResolve = nostrResolve; nostrReadyReject = nostrReject; });
+  const nostrStatus = (nostrStatusName, nostrRelay, nostrMessage) => {
+    if (nostrClosed && nostrStatusName !== 'closed') return;
+    try { onStatus({type: 'signaler', transport: 'nostr', status: nostrStatusName, ...(nostrRelay ? {relay: nostrRelay} : {}), ...(nostrMessage ? {message: String(nostrMessage)} : {})}); } catch { /* An observer cannot break signaling. */ }
+  };
+
+  function nostrFinishPublication(nostrEventId, nostrError) {
+    const nostrPublication = nostrPending.get(nostrEventId);
+    if (!nostrPublication) return;
+    clearTimeout(nostrPublication.timer);
+    nostrPending.delete(nostrEventId);
+    if (nostrError) nostrPublication.reject(nostrError);
+    else nostrPublication.resolve();
+  }
+
+  function nostrPublicationFailure(nostrState, nostrEventId, nostrReason) {
+    const nostrPublication = nostrPending.get(nostrEventId);
+    if (!nostrPublication || !nostrPublication.remaining.delete(nostrState)) return;
+    nostrPublication.failures.push(`${nostrState.url}: ${nostrReason}`);
+    if (nostrPublication.remaining.size === 0 && !nostrStates.some(nostrRelay => !nostrRelay.failed && !nostrRelay.ready)) nostrFinishPublication(nostrEventId,
+      new Error(`No Nostr relay accepted the event: ${nostrPublication.failures.join('; ')}`));
+  }
+
+  function nostrFailRelay(nostrState, nostrReason) {
+    if (nostrState.failed || nostrClosed) return;
+    nostrState.failed = true;
+    nostrState.ready = false;
+    clearTimeout(nostrState.timer);
+    for (const nostrRemove of nostrState.remove) nostrRemove();
+    try { nostrState.socket?.close(); } catch { /* Already closed. */ }
+    for (const nostrEventId of nostrPending.keys()) nostrPublicationFailure(nostrState, nostrEventId, nostrReason);
+    nostrStatus('error', nostrState.url, nostrReason);
+    if (!nostrInitializationSettled && nostrStates.length === nostrUrls.length && nostrStates.every(nostrRelay => nostrRelay.failed)) {
+      nostrInitializationSettled = true;
+      nostrReadyReject(new Error(`No Nostr relay became ready: ${nostrReason}`));
+    }
+  }
+
+  function nostrDeliver(nostrEnvelope) {
+    if (nostrClosed) return;
+    if (!nostrHasSubscriber) {
+      if (nostrBacklog.length === 32) nostrBacklog.shift();
+      nostrBacklog.push(nostrEnvelope);
+      return;
+    }
+    for (const nostrHandler of [...nostrListeners]) {
+      if (nostrClosed) break;
+      try {
+        const nostrResult = nostrHandler(nostrEnvelope);
+        if (nostrResult && typeof nostrResult.then === 'function') Promise.resolve(nostrResult).catch(nostrError => nostrStatus('error', null, nostrError?.message || 'Signaling subscriber failed'));
+      } catch (nostrError) { nostrStatus('error', null, nostrError?.message || 'Signaling subscriber failed'); }
+    }
+  }
+
+  async function nostrReceive(nostrEvent) {
+    if (nostrClosed || !nostrEvent || typeof nostrEvent !== 'object' || Array.isArray(nostrEvent) ||
+        typeof nostrEvent.id !== 'string' || typeof nostrEvent.pubkey !== 'string' || typeof nostrEvent.sig !== 'string' ||
+        !nostrHex32.test(nostrEvent.id) || !nostrHex32.test(nostrEvent.pubkey) || !nostrHex64.test(nostrEvent.sig) ||
+        nostrEvent.pubkey === nostrId || nostrEvent.kind !== 20078 || !Number.isSafeInteger(nostrEvent.created_at) ||
+        typeof nostrEvent.content !== 'string' || nostrEvent.content.length > nostrContentLimit ||
+        !Array.isArray(nostrEvent.tags) || nostrEvent.tags.length > 16 || nostrVerifying.size >= 32) return;
+    const nostrNow = Date.now();
+    const nostrNowSeconds = Math.floor(nostrNow / 1000);
+    if (nostrEvent.created_at < nostrNowSeconds - nostrFreshSeconds || nostrEvent.created_at > nostrNowSeconds + nostrFutureSeconds ||
+        nostrEncoder.encode(nostrEvent.content).length > nostrContentLimit) return;
+    for (const [nostrSeenId, nostrExpiry] of nostrSeen) { if (nostrExpiry > nostrNow) break; nostrSeen.delete(nostrSeenId); }
+    if (nostrSeen.has(nostrEvent.id) || nostrVerifying.has(nostrEvent.id)) return;
+    if (!nostrEvent.tags.every(nostrTag => Array.isArray(nostrTag) && nostrTag.length > 0 && nostrTag.length <= 4 &&
+        nostrTag.every(nostrValue => typeof nostrValue === 'string' && nostrEncoder.encode(nostrValue).length <= 256))) return;
+    const nostrRoomTags = nostrEvent.tags.filter(nostrTag => nostrTag[0] === 'd');
+    const nostrRecipientTags = nostrEvent.tags.filter(nostrTag => nostrTag[0] === 'p');
+    if (nostrRoomTags.length !== 1 || nostrRoomTags[0][1] !== nostrRoomTag) return;
+    let nostrContent;
+    try { nostrContent = JSON.parse(nostrEvent.content); } catch { return; }
+    if (!nostrContent || nostrContent.v !== 1 || nostrContent.namespace !== namespace || nostrContent.room !== room ||
+        nostrContent.from !== nostrEvent.pubkey || typeof nostrContent.nonce !== 'string' || !/^[0-9a-f]{32}$/.test(nostrContent.nonce) ||
+        (nostrContent.to !== '*' && nostrContent.to !== nostrId) || !nostrIsSignalMessage(nostrContent.message)) return;
+    if (nostrContent.to === '*' ? nostrRecipientTags.length !== 0 :
+        nostrRecipientTags.length !== 1 || nostrRecipientTags[0][1] !== nostrContent.to) return;
+    nostrVerifying.add(nostrEvent.id);
+    try {
+      const nostrHashBytes = await nostrHash(nostrEncoder.encode(JSON.stringify([0, nostrEvent.pubkey, nostrEvent.created_at, nostrEvent.kind, nostrEvent.tags, nostrEvent.content])), cryptoImpl);
+      if (nostrToHex(nostrHashBytes) !== nostrEvent.id || !await nostrVerify(nostrFromHex(nostrEvent.sig), nostrHashBytes, nostrFromHex(nostrEvent.pubkey), cryptoImpl) || nostrClosed) return;
+      if (nostrSeen.size >= 2048) nostrSeen.delete(nostrSeen.keys().next().value);
+      nostrSeen.set(nostrEvent.id, nostrNow + 300000);
+      nostrDeliver({from: nostrContent.from, to: nostrContent.to, message: nostrContent.message});
+    } catch (nostrError) { nostrStatus('error', null, nostrError?.message || 'Nostr verification failed'); }
+    finally { nostrVerifying.delete(nostrEvent.id); }
+  }
+
+  function nostrHandleMessage(nostrState, nostrData) {
+    if (nostrClosed || nostrState.failed || typeof nostrData !== 'string' || nostrData.length > 1024 * 1024) return;
+    let nostrFrame;
+    try { nostrFrame = JSON.parse(nostrData); } catch { return; }
+    if (!Array.isArray(nostrFrame)) return;
+    if (nostrFrame[0] === 'EOSE' && nostrFrame.length === 2 && nostrFrame[1] === nostrSubscription && nostrState.requested) {
+      if (nostrState.ready) return;
+      nostrState.ready = true;
+      clearTimeout(nostrState.timer);
+      nostrStatus('connected', nostrState.url);
+      if (!nostrInitializationSettled) { nostrInitializationSettled = true; nostrReadyResolve(); }
+      // A fast relay can reject a publication while a fallback is still opening.
+      // Forward the same signed event when that fallback becomes ready.
+      for (const nostrPublication of nostrPending.values()) if (!nostrPublication.attempted.has(nostrState)) {
+        nostrPublication.attempted.add(nostrState); nostrPublication.remaining.add(nostrState);
+        try { nostrState.socket.send(nostrPublication.frame); }
+        catch (nostrError) { nostrFailRelay(nostrState, nostrError?.message || 'Fallback publication failed'); }
+      }
+    } else if (nostrFrame[0] === 'EVENT' && nostrFrame.length === 3 && nostrFrame[1] === nostrSubscription && nostrState.requested) {
+      void nostrReceive(nostrFrame[2]);
+    } else if (nostrFrame[0] === 'OK' && nostrFrame.length === 4 && typeof nostrFrame[1] === 'string' &&
+        typeof nostrFrame[2] === 'boolean' && typeof nostrFrame[3] === 'string') {
+      const nostrPublication = nostrPending.get(nostrFrame[1]);
+      if (!nostrPublication?.remaining.has(nostrState)) return;
+      if (nostrFrame[2]) { nostrFinishPublication(nostrFrame[1]); nostrStatus('published', nostrState.url); }
+      else nostrFailRelay(nostrState, nostrFrame[3].slice(0, 256) || 'Relay rejected the event');
+    } else if (nostrFrame[0] === 'CLOSED' && nostrFrame.length === 3 && nostrFrame[1] === nostrSubscription && typeof nostrFrame[2] === 'string') {
+      nostrFailRelay(nostrState, `Relay ended the signaling subscription: ${nostrFrame[2].slice(0, 256)}`);
+    } else if (nostrFrame[0] === 'NOTICE' && typeof nostrFrame[1] === 'string') {
+      nostrStatus('notice', nostrState.url, nostrFrame[1].slice(0, 256));
+    }
+  }
+
+  function nostrClose() {
+    if (nostrClosed) return;
+    nostrClosed = true;
+    signal?.removeEventListener('abort', nostrClose);
+    for (const [nostrTimer, nostrReject] of nostrWaiters) { clearTimeout(nostrTimer); nostrReject(new Error('Nostr signaler closed')); }
+    nostrWaiters.clear();
+    for (const nostrState of nostrStates) {
+      clearTimeout(nostrState.timer);
+      if (nostrState.socket?.readyState === 1 && nostrState.requested) {
+        try { nostrState.socket.send(JSON.stringify(['CLOSE', nostrSubscription])); } catch { /* Best-effort unsubscribe. */ }
+      }
+      for (const nostrRemove of nostrState.remove) nostrRemove();
+      try { nostrState.socket?.close(); } catch { /* Already closed. */ }
+      nostrState.ready = false;
+    }
+    for (const nostrEventId of nostrPending.keys()) nostrFinishPublication(nostrEventId, new Error('Nostr signaler closed'));
+    if (!nostrInitializationSettled) { nostrInitializationSettled = true; nostrReadyReject(new Error('Nostr signaler closed')); }
+    nostrSecret.fill(0);
+    nostrListeners.clear();
+    nostrBacklog.length = 0;
+    nostrSeen.clear();
+    nostrVerifying.clear();
+    nostrStatus('closed');
+  }
+
+  signal?.addEventListener('abort', nostrClose, { once: true });
+  for (const nostrUrl of nostrUrls) {
+    if (nostrClosed) break;
+    const nostrState = {url: nostrUrl, socket: null, ready: false, requested: false, failed: false, remove: [], timer: null};
+    nostrStates.push(nostrState);
+    nostrStatus('connecting', nostrUrl);
+    if (nostrClosed) break;
+    try {
+      const nostrSocket = nostrState.socket = new WebSocketImpl(nostrUrl);
+      if (nostrClosed) { try { nostrSocket.close(); } catch { /* Already closed. */ } break; }
+      nostrState.timer = setTimeout(() => nostrFailRelay(nostrState, 'Nostr connection/subscription timed out'), timeoutMs);
+      const nostrOpen = () => {
+        if (nostrClosed || nostrState.failed || nostrState.requested) return;
+        nostrState.requested = true;
+        try { nostrSocket.send(JSON.stringify(['REQ', nostrSubscription, {kinds: [20078], '#d': [nostrRoomTag], since: Math.floor(Date.now() / 1000) - nostrFreshSeconds, limit: 0}])); }
+        catch (nostrError) { nostrFailRelay(nostrState, nostrError?.message || 'Nostr subscription failed'); }
+      };
+      nostrState.remove.push(
+        nostrListen(nostrSocket, 'open', nostrOpen),
+        nostrListen(nostrSocket, 'message', nostrEvent => nostrHandleMessage(nostrState, nostrEvent.data)),
+        nostrListen(nostrSocket, 'error', () => nostrFailRelay(nostrState, 'Nostr WebSocket error')),
+        nostrListen(nostrSocket, 'close', () => nostrFailRelay(nostrState, 'Nostr relay disconnected'))
+      );
+      if (nostrSocket.readyState === 1) nostrOpen();
+    } catch (nostrError) { nostrFailRelay(nostrState, nostrError?.message || 'Nostr connection failed'); }
+  }
+  try { await nostrReady; } catch (nostrError) { nostrClose(); throw nostrError; }
+
+  return {
+    id: nostrId,
+    room,
+    async send(nostrTo, nostrMessage) {
+      if (nostrClosed) throw new Error('Nostr signaler closed');
+      if (nostrTo !== '*' && (typeof nostrTo !== 'string' || !nostrHex32.test(nostrTo))) throw new TypeError('Nostr recipient must be a lowercase public key or *');
+      if (!nostrIsSignalMessage(nostrMessage)) throw new TypeError('Nostr carries discovery, presence, offer, answer, ice and bye signaling only');
+      if (nostrSending >= 64) throw new Error('Too many pending Nostr publications');
+      if (!nostrStates.some(nostrState => nostrState.ready && !nostrState.failed && nostrState.socket.readyState === 1)) throw new Error('No live Nostr relays');
+      nostrSending++;
+      const nostrPrevious = nostrSendTail;
+      let nostrUnlock;
+      nostrSendTail = new Promise(nostrResolve => { nostrUnlock = nostrResolve; });
+      try {
+        let nostrContent;
+        try { nostrContent = JSON.stringify({v: 1, namespace, room, from: nostrId, to: nostrTo, nonce: nostrToHex(nostrRandom(16)), message: nostrMessage}); }
+        catch { throw new TypeError('Nostr signaling message must be JSON serializable'); }
+        if (nostrEncoder.encode(nostrContent).length > nostrContentLimit) throw new RangeError('Nostr signaling content exceeds 128 KiB');
+        if (!nostrIsSignalMessage(JSON.parse(nostrContent).message)) throw new TypeError('Nostr signaling message serialization changed its type');
+        await nostrPrevious;
+        if (nostrClosed) throw new Error('Nostr signaler closed');
+        const nostrWait = publishIntervalMs - (Date.now() - nostrLastPublication);
+        if (nostrWait > 0) await new Promise((nostrResolve, nostrReject) => {
+          const nostrTimer = setTimeout(() => { nostrWaiters.delete(nostrTimer); nostrResolve(); }, nostrWait);
+          nostrWaiters.set(nostrTimer, nostrReject);
+        });
+        if (nostrClosed) throw new Error('Nostr signaler closed');
+        const nostrEvent = {pubkey: nostrId, created_at: Math.floor(Date.now() / 1000), kind: 20078,
+          tags: [['d', nostrRoomTag], ...(nostrTo === '*' ? [] : [['p', nostrTo]])], content: nostrContent};
+        const nostrHashBytes = await nostrHash(nostrEncoder.encode(JSON.stringify([0, nostrId, nostrEvent.created_at, nostrEvent.kind, nostrEvent.tags, nostrContent])), cryptoImpl);
+        if (nostrClosed) throw new Error('Nostr signaler closed');
+        const nostrAuxiliary = nostrRandom(32);
+        try { nostrEvent.sig = nostrToHex(await nostrSign(nostrHashBytes, nostrSecret, nostrAuxiliary, cryptoImpl)); }
+        finally { nostrAuxiliary.fill(0); }
+        nostrEvent.id = nostrToHex(nostrHashBytes);
+        if (nostrClosed) throw new Error('Nostr signaler closed');
+        const nostrAvailable = nostrStates.filter(nostrState => nostrState.ready && !nostrState.failed && nostrState.socket.readyState === 1);
+        if (nostrAvailable.length === 0) throw new Error('No live Nostr relays');
+        const nostrFrame = JSON.stringify(['EVENT', nostrEvent]);
+        nostrLastPublication = Date.now();
+        await new Promise((nostrResolve, nostrReject) => {
+          const nostrPublication = {resolve: nostrResolve, reject: nostrReject, remaining: new Set(nostrAvailable),
+            attempted: new Set(nostrAvailable), frame: nostrFrame, failures: [], timer: null};
+          nostrPending.set(nostrEvent.id, nostrPublication);
+          nostrPublication.timer = setTimeout(() => nostrFinishPublication(nostrEvent.id, new Error('Nostr publication timed out without a positive relay OK')), timeoutMs);
+          for (const nostrState of nostrAvailable) {
+            if (nostrClosed) break;
+            try { nostrState.socket.send(nostrFrame); }
+            catch (nostrError) { nostrFailRelay(nostrState, nostrError?.message || 'Nostr publication failed'); }
+          }
+        });
+      } finally { await nostrPrevious; nostrSending--; nostrUnlock(); }
+    },
+    subscribe(nostrHandler) {
+      if (nostrClosed) throw new Error('Nostr signaler closed');
+      if (typeof nostrHandler !== 'function') throw new TypeError('Signaling subscriber must be a function');
+      nostrListeners.add(nostrHandler);
+      if (!nostrHasSubscriber) {
+        nostrHasSubscriber = true;
+        const nostrQueued = nostrBacklog.splice(0);
+        for (const nostrEnvelope of nostrQueued) nostrDeliver(nostrEnvelope);
+      }
+      return () => nostrListeners.delete(nostrHandler);
+    },
+    close: nostrClose
+  };
+}
