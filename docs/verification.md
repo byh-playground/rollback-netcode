@@ -72,3 +72,24 @@ fixed-point 100,000회 제한 범위 곱셈은 BigInt 기준 22.99ms, 안전 정
 2026-10-03 랠리 URL 소비 연계 검증: 실제 Edge RTC 240tick/oracle/replay hash 67059ea7 일치. 랠리 후보는 URL 응답을 명시적으로 후보 생성물로 제공한 테스트에서 상태 11, AI 9, 수명주기 6 검사를 통과했다. 손실/지연/역순 깊이3 롤백, 종료 깊이5 롤백, 손상 chunk 거부 후 복구와 replay 결과 일치를 확인했다. 공개 API 미배포/오프라인 로딩 실패를 실제 URL 경로에서 오류로 표시한다. 후보 검증과 공개 배포 성공은 구분한다.
 
 랠리 78/158유닛에서 같은 상태·35tick 결과가 JSON/바이너리로 동일했다. 반복 문자열 참조 후 126427→43675B, 232165→75253B. 숫자 바이트 hash는 포맷 변경으로 달라지므로 복원 데이터/최종 게임 결과를 비교했다. 중복 JSON 복사를 제거한 JSON만의 restore는 binary보다 빠를 수 있으며 바이너리가 모든 비용에서 우세하다고 주장하지 않는다. 전체 벤치 재현은 랠리 scripts/netcode-codec-benchmark.cjs에 있다.
+
+
+## 2026-10-03 외부 루프 capability와 Synctest 메트릭 후보
+
+- 전체 `node --test tests/*.test.mjs`: **91개 PASS**. 추가된 manual pulse, clock-before-poll, step별 terminal guard, hold 중 poll/recovery/render, timing reset, CPU budget, 기존 RAF start/stop/error 경로를 확인했습니다.
+- Synctest SDK의 frozen metrics snapshot, history 바이트·hash·실행/재실행 수, 내부 비용 측정, failure 요약과 batch 실패 시 `error.syncTestMetrics`, 원래 게임 상태 복원을 검사했습니다. hash는 이력 snapshot에 캐시됩니다.
+- `npx --yes -p typescript tsc --noEmit --strict --target es2022 --module nodenext --lib es2022,dom tests/types.test.ts` PASS. 새 loop API와 readonly 진단 metrics 소비자 타입을 확인했습니다.
+- `node scripts/browser-check.mjs`: 실제 Chromium에서 새 loop와 runSyncTest metrics API PASS. 독립 두 context의 실제 RTCPeerConnection 240 tick에서 oracle/replay 및 양쪽 최종 hash 1728421543 일치, browser error 0, rollback depth 12.
+- 새 API는 이 worktree의 적용 후보이며 공개 URL 배포 여부는 별도입니다. 랠리 실제 게임·UI 검증은 소비자 통합 작업에서 수행합니다. 동기 poll/step 한 번의 중간 취소나 물리 모바일/외부 NAT 두 기기 성능을 검증한 결과가 아닙니다.
+
+
+### 비동기 Synctest 보완
+
+동기식 32 tick×checkDistance 6 진단이 랠리 실제 브라우저에서 약 1초 동안 JS를 점유해 Core interruption을 일으킨 후보는 최종 PASS로 보지 않습니다. 공통 `runSyncTestAsync`를 추가해 SDK가 각 기존 SynctestSession.advance 전/후 event loop에 제어를 양보하도록 수정했습니다. 라이브 Adapter 대신 동일 게임의 독립 진단 Adapter를 써야 한다는 사용 계약을 README에 명시했습니다. async 결과와 실패 metrics는 동기 API와 같으며 abort는 원래 snapshot을 복원하고 reason을 전합니다.
+- 비동기 보완 후 전체 자동 검사 **93개 PASS**, strict TypeScript PASS. 실제 브라우저 default yield 중 interval heartbeat가 계속 실행됐으며 동기/비동기 결과 hash와 초기 상태 복원이 일치했습니다. 이어서 실제 RTC 240 tick oracle/replay hash 1728421543 일치 PASS.
+
+
+### 확정 입력 prefix와 비용 측정 보완
+
+`exportSyncTestFrames({maxFrames})`가 첫 확정 기록을 최대 256개만 독립 복사하도록 추가했습니다. 긴 전체 replay를 복사 후 slice하지 않으며 선택되지 않은 frame의 inputs getter를 실행하면 throw하는 검사로 범위 밖 복사를 하지 않는 것을 확인했습니다. 잘린 기록 뒤 frame은 생성하지 않고 initialTick 0을 제공합니다. Synctest 시간은 mandatory forward restore가 성공하거나 throw해도 포함하도록 옮겼습니다. batch 초기 save/final restore와 async yield 대기는 범위 밖입니다. 비동기 양보는 **tick 경계**에서 하며 한 advance 안의 checkDistance 재실행은 여전히 동기입니다.
+- 보완 최종 검사: 전체 자동 **96개 PASS**, strict TypeScript PASS, 실제 브라우저 bounded prefix 독립 복사와 async heartbeat PASS, 두 RTC 240 tick 최종 hash 1728421543 일치 PASS. 원래 동기 진단 후보의 1초 interruption 결과는 이 보완의 최종 PASS 범위에 포함하지 않습니다.

@@ -89,3 +89,9 @@ Core는 상태·명령을 게임 구조를 모르는 opaque bytes로 취급한�
 binary는 RV version 1 헤더, 타입 태그, little-endian 길이/유한 float64 및 int32 최소 zigzag varint, 유효 UTF-8과 UTF-16 사전순 record key를 사용한다. -0은 0으로 정규화하며 지원하지 않는 값과 비정규 bytes는 거부한다. decode는 크기·깊이·값 개수 한도와 완전한 소비를 검사한다. 형식 변경의 byte hash 차이는 게임 결과 차이의 근거가 아니므로 복원 권위 상태·입력별 최종 결과 동등성과 실제 게임 총 CPU를 함께 검증한다.
 
 바이너리 문자열은 payload별 최초 등록 순서 dictionary를 사용하고 반복 key/value를 최소 varuint 참조로 기록한다. 이전 payload나 cache 상태는 직렬화 결과에 영향을 주지 않으며 중복 literal/미등록 참조를 거부한다. dictionary에도 기존 값 개수·byte 예산을 적용한다.
+
+## 실행과 진단 capability의 소비
+
+createLoop의 자동 frame과 수동 pulse는 같은 시간 누적·pacing·작업량 경계를 사용한다. 소비자는 beforeFrame으로 외부 clock을 연결하고 canAdvance로 경기 시작/종료 같은 애플리케이션 수명주기를 조정하며 onAdvance/render로 확정된 결과를 표현한다. 게임에 별도 accumulator나 따라잡기 알고리즘을 만들지 않는다. 실행이 보류돼도 poll과 render는 계속하며 Core가 budgeted recovery/resimulation을 수행한다. maxWorkMs는 스케줄러 작업 예산이며 simulation dt를 바꾸지 않는다.
+
+Synctest.metrics는 라이브러리가 소유하는 검사 틱·재실행 틱·거리·보관 bytes·상태 hash·실패 요약 및 검사 시간을 제공한다. runSyncTest 성공 결과와 실패 error.syncTestMetrics에도 같은 snapshot을 제공한다. 소비자가 자체 검사 엔진이나 카운터를 만들지 않는다. 이 메트릭은 실제 load/resimulation 검사한 입력 구간을 설명하며 온라인 peer 일치·서로 다른 엔진/기기 결정론을 대신 증명하지 않는다. 검사는 추가 저장/재실행 CPU를 사용하므로 소비자는 실행 범위와 발동을 명시해야 한다.

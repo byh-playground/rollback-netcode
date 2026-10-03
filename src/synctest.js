@@ -19,9 +19,12 @@ export function createSyncTestSession(options){return new SyncTestSession(option
 /** Local determinism diagnostic; all players supply actual input. No transport or clock. */
 export class SyncTestSession {
   constructor({adapter,players,inputSize,tickRate=60,initialTick=0,checkDistance=1,
-    maxSnapshotBytes=4*1024*1024,maxHistoryBytes=64*1024*1024}={}){
+    maxSnapshotBytes=4*1024*1024,maxHistoryBytes=64*1024*1024,
+    now=()=>globalThis.performance?.now()??Date.now()}={}){
     if(!adapter||['save','load','step','validateSnapshot'].some(key=>typeof adapter[key]!=='function'))throw new TypeError('Simulation Adapter capabilities');
     if(!Array.isArray(players)||!players.length||players.length>8||players.some(id=>typeof id!=='string'||!id.length)||new Set(players).size!==players.length)throw new TypeError('fixed player roster');
+    if(typeof now!=='function')throw new TypeError('diagnostic clock');
+    this._now=now;this._cost={forwardCostMs:0,resimulationCostMs:0,totalCostMs:0};
     this.adapter=adapter;this.players=Object.freeze([...players].sort(compareIds));
     this.inputSize=integer(inputSize,'inputSize',1,1024);this.tickRate=integer(tickRate,'tickRate',1,240);
     this.checkDistance=integer(checkDistance,'checkDistance',1,256);this._tick=integer(initialTick,'initialTick',0,MAX_TICK);
@@ -36,6 +39,15 @@ export class SyncTestSession {
   }
   get tick(){return this._tick}
   get status(){return this.closed?'closed':this.failure?'failed':'running'}
+  get metrics(){
+    const error=this.failure;
+    const failure=error?Object.freeze({name:error.name??'Error',message:String(error.message??error),
+      code:error.code??null,tick:error.tick??null,checkpointTick:error.checkpointTick??null,
+      firstDifference:error.firstDifference??null,expectedHash:error.expectedHash??null,actualHash:error.actualHash??null}):null;
+    return Object.freeze({status:this.status,tick:this.tick,checkDistance:this.checkDistance,
+      checkedTicks:this.checkedTicks,resimulatedTicks:this.resimulatedTicks,stateHash:this.closed?null:this.getStateHash()??null,
+      historyBytes:this._history.byteLength,failure,...this._cost});
+  }
   _save(){const value=bytes(this.adapter.save()).slice();if(!value.length||value.length>this.maxSnapshotBytes)throw new RangeError('snapshot size');return value}
   _inputs(inputs){
     if(!Array.isArray(inputs)||inputs.length!==this.players.length)throw new TypeError('all local player inputs required');
@@ -55,10 +67,11 @@ export class SyncTestSession {
     if(this.closed)throw new Error('sync test closed');if(this.failure)throw this.failure;
     integer(this.tick+1,'tick limit',0,MAX_TICK);
     const frames=this._inputs(inputs),before=this._history.get(this.tick),frameTick=this.tick;
-    let forward=before.bytes;
+    let forward=before.bytes;const started=this._now();let replayStarted;
     try{
       runSimulationFrame(this.adapter,{tick:frameTick,tickRate:this.tickRate,inputs:frames,resimulating:false,synctesting:true});
       const next=this._save();this._history.put({tick:frameTick+1,bytes:next});forward=next;this._frames.set(frameTick,frames);this._tick++;
+      replayStarted=this._now();this._cost.forwardCostMs+=Math.max(0,replayStarted-started);
       const from=Math.max(this.initialTick,this.tick-this.checkDistance);
       this.adapter.load(this._history.get(from).bytes.slice());
       for(let tick=from;tick<this.tick;tick++){
@@ -72,19 +85,63 @@ export class SyncTestSession {
     finally{
       // Restore the forward snapshot even after a partial diagnostic replay.
       try{this.adapter.load(forward.slice())}catch(error){if(this.failure)this.failure.restoreError=error;else{this.failure=error;throw error}}
+      finally{
+        const finished=this._now();
+        if(replayStarted!==undefined)this._cost.resimulationCostMs+=Math.max(0,finished-replayStarted);
+        else this._cost.forwardCostMs+=Math.max(0,finished-started);
+        this._cost.totalCostMs+=Math.max(0,finished-started);
+      }
     }
     return {tick:this.tick,checkedTicks:this.checkedTicks,resimulatedTicks:this.resimulatedTicks};
   }
-  getStateHash(){return hashBytes(this._history.get(this.tick).bytes)}
+  getStateHash(){const state=this._history.get(this.tick);if(!state)return undefined;if(state.hash===undefined)state.hash=hashBytes(state.bytes);return state.hash}
   close(){this.closed=true;this._frames.clear();this._history.slots.fill(undefined);this._history.byteLength=0}
+}
+
+function beginSyncTestBatch(frames,options){
+  if(!Array.isArray(frames))throw new TypeError('frames');
+  return {initial:bytes(options.adapter.save()).slice(),session:createSyncTestSession(options)};
+}
+function advanceSyncTestBatch(session,frame){
+  if(frame.tick!==session.tick)throw new TypeError('non-contiguous test frames');
+  session.advance(frame.inputs);
+}
+function syncTestBatchResult(session){
+  return {tick:session.tick,checkedTicks:session.checkedTicks,resimulatedTicks:session.resimulatedTicks,hash:session.getStateHash(),metrics:session.metrics};
+}
+function syncTestBatchFailure(session,error){
+  const failure=error instanceof Error?error:new Error(String(error));
+  session.failure??=failure;failure.syncTestMetrics=session.metrics;return failure;
+}
+function checkSyncTestAbort(signal){
+  if(signal?.aborted){
+    if(signal.reason instanceof Error)throw signal.reason;
+    const error=new Error(signal.reason===undefined?'Synctest aborted':String(signal.reason));error.name='AbortError';throw error;
+  }
 }
 
 /** Batch check. Restores the caller's initial serialized state on completion/failure. */
 export function runSyncTest({frames,...options}={}){
-  if(!Array.isArray(frames))throw new TypeError('frames');
-  const initial=bytes(options.adapter.save()).slice(),session=createSyncTestSession(options);
+  const {initial,session}=beginSyncTestBatch(frames,options);
   try{
-    for(const frame of frames){if(frame.tick!==session.tick)throw new TypeError('non-contiguous test frames');session.advance(frame.inputs)}
-    return {tick:session.tick,checkedTicks:session.checkedTicks,resimulatedTicks:session.resimulatedTicks,hash:session.getStateHash()};
-  }finally{session.close();options.adapter.load(initial)}
+    for(const frame of frames)advanceSyncTestBatch(session,frame);
+    return syncTestBatchResult(session);
+  }catch(error){throw syncTestBatchFailure(session,error)}
+  finally{session.close();options.adapter.load(initial)}
+}
+
+/** Cooperative batch check using the same session and frame boundary as the synchronous API. */
+export async function runSyncTestAsync({frames,yieldControl=()=>new Promise(resolve=>setTimeout(resolve,0)),signal,...options}={}){
+  if(typeof yieldControl!=='function')throw new TypeError('yieldControl');
+  const {initial,session}=beginSyncTestBatch(frames,options);
+  try{
+    checkSyncTestAbort(signal);
+    for(const frame of frames){
+      await yieldControl();checkSyncTestAbort(signal);
+      advanceSyncTestBatch(session,frame);
+      await yieldControl();checkSyncTestAbort(signal);
+    }
+    return syncTestBatchResult(session);
+  }catch(error){throw syncTestBatchFailure(session,error)}
+  finally{session.close();options.adapter.load(initial)}
 }
