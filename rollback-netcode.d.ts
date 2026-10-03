@@ -165,7 +165,7 @@ export function createWebRTCPeer(options: PeerOptions): Promise<PeerConnection>;
 export interface RoomOptions { role: 'host' | 'join'; room?: string; namespace?: string; relays?: string[]; rtcConfig?: RTCConfiguration; timeoutMs?: number; onStatus?: (status: ConnectionStatus) => void; signal?: AbortSignal; signalerFactory?: typeof createNostrSignaler; peerFactory?: typeof createWebRTCPeer; }
 export function createNostrRoom(options: RoomOptions): Promise<PeerConnection & { room: string; sessionId: string; localPlayerId: string; remotePlayerId: string }>;
 export type RoomTopology = 'mesh' | 'star';
-export interface GroupRoomStatus {
+export interface GroupRoomStatus extends ConnectionStatus {
   type: string; room?: string; role?: 'host' | 'join'; playerCount?: number; topology?: RoomTopology;
   phase?: string; players?: readonly PlayerId[]; localPlayerId?: PlayerId; peerId?: PlayerId;
   reason?: string; previousPhase?: string; event?: ConnectionStatus;

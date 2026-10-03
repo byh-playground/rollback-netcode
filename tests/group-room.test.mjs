@@ -44,7 +44,7 @@ function fixture({ drop = () => false, pendingPeers = false } = {}) {
   };
 }
 
-for (const topology of ['mesh', 'star']) for (const playerCount of [2, 3, 4, 8]) {
+for (const topology of ['mesh', 'star']) for (const playerCount of [2, 3, 4, 5, 6, 7, 8]) {
   test(`${playerCount}-player ${topology}: agreed roster, every logical route, full-size payload and cleanup`, async () => {
     const f = fixture(), rooms = await Promise.all(Array.from({ length: playerCount }, (_, i) =>
       createNostrGroupRoom({ ...f.options, role: i ? 'join' : 'host', playerCount, topology })));
@@ -109,6 +109,20 @@ test('malformed agreed-host roster is rejected rather than starting a partial se
 
 test('invalid player counts are rejected before signaling', async () => {
   for (const playerCount of [0, 1, 9, 2.5, NaN]) await assert.rejects(createNostrGroupRoom({ role: 'host', playerCount }), /playerCount/);
+});
+
+test('another host cannot tear down an already running room with a collision advertisement', async () => {
+  const f = fixture(), rooms = await Promise.all([0, 1].map(i => createNostrGroupRoom({ ...f.options, role: i ? 'join' : 'host' })));
+  try {
+    await assert.rejects(createNostrGroupRoom({ ...f.options, role: 'host' }), /already in use/);
+    assert.ok(rooms.every(r => !r.closed)); assert.equal(f.connections.length, 2);
+  } finally { rooms.forEach(r => r.close()); await settle(); }
+  assert.equal(f.liveSignallers, 0);
+});
+
+test('formation timeout closes signaling without allocating partial connections', async () => {
+  const f = fixture(); await assert.rejects(createNostrGroupRoom({ ...f.options, role: 'host', timeoutMs: 30, playerCount: 8 }), /timeout/);
+  await settle(); assert.equal(f.liveSignallers, 0); assert.equal(f.connections.length, 0);
 });
 
 test('unchanged Core converges through the N-player star routes, including one-shot commands and replay', async () => {
