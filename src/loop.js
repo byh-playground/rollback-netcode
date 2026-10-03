@@ -1,12 +1,10 @@
 /** Fixed Simulation dt, separately adjustable real-time scheduling. No import side effects. */
 export function createLoop({ session, getInput = () => new Uint8Array(session.inputSize), render = () => {},
-  beforeFrame = () => {}, canAdvance = () => true, onAdvance = () => {}, maxWorkMs = Infinity,
-  now = () => globalThis.performance?.now() ?? Date.now(),
+  beforeFrame = () => {}, canAdvance = () => true, onAdvance = () => {},
   onError = error => { throw error; }, onInputRelease = () => {}, requestFrame = globalThis.requestAnimationFrame?.bind(globalThis),
   cancelFrame = globalThis.cancelAnimationFrame?.bind(globalThis) } = {}) {
   if (!session || typeof session.poll !== 'function' || typeof session.advance !== 'function') throw new TypeError('session capability');
-  if (!(maxWorkMs > 0) || typeof maxWorkMs !== 'number') throw new RangeError('maxWorkMs');
-  for (const callback of [getInput, render, beforeFrame, canAdvance, onAdvance, now, onError, onInputRelease]) {
+  for (const callback of [getInput, render, beforeFrame, canAdvance, onAdvance, onError, onInputRelease]) {
     if (typeof callback !== 'function') throw new TypeError('loop callback');
   }
   const quantum = 1000 / session.profile.tickRate;
@@ -25,14 +23,13 @@ export function createLoop({ session, getInput = () => new Uint8Array(session.in
   const pulse = timestamp => {
     try {
       if (!Number.isFinite(timestamp)) throw new TypeError('frame timestamp');
-      const started = now(); beforeFrame(timestamp);
+      beforeFrame(timestamp);
       if (last === undefined) last = timestamp;
       accumulator = Math.min(accumulator + Math.max(0, Math.min(250, timestamp - last)), quantum * session.profile.maxCatchupSteps);
       last = timestamp; session.poll();
       let work = 0;
       while (!session.closed && !session.resimulating && accumulator >= quantum * session.metrics.pace && work < session.profile.maxCatchupSteps) {
         if (!canAdvance()) { accumulator = Math.min(accumulator, quantum); break; }
-        if (now() - started >= maxWorkMs) break;
         const pace = session.metrics.pace;
         const result = session.advance(getInput()); work++;
         if (result.status === 'advanced') accumulator = Math.max(0, accumulator - quantum * pace);
@@ -40,7 +37,7 @@ export function createLoop({ session, getInput = () => new Uint8Array(session.in
         onAdvance(result);
         if (result.status !== 'advanced') { accumulator = Math.min(accumulator, quantum); break; }
       }
-      // Rendering continues on holds. During a budgeted replay, retain the prior render bridge.
+      // Rendering continues when the session is waiting for input or connection recovery.
       render({ session, alpha: Math.min(1, accumulator / quantum), resimulating: session.resimulating });
     } catch (error) { stop(); onError(error); }
   };

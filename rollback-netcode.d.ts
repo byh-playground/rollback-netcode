@@ -30,7 +30,7 @@ export interface Profile {
   tickRate: number; baseInputDelayTicks: number; minInputDelayTicks: number; maxInputDelayTicks: number;
   rollbackWindowTicks: number; stateHistorySize: number; predictionPolicy: PredictionPolicy; stallPolicy: 'wait';
   tickDriftThreshold: number; pacingPolicy: 'none' | 'hold' | 'dilation'; checksumInterval: number;
-  resimulationBudget: number; maxCatchupSteps: number; adaptiveInputDelay: boolean;
+  maxCatchupSteps: number; adaptiveInputDelay: boolean;
   heartbeatMs: number; adaptationIntervalMs: number; peerInterruptMs: number; peerTimeoutMs: number;
   maxSnapshotBytes: number; maxHistoryBytes: number; maxReplayBytes: number;
   maxCommandBytes: number; maxPendingCommands: number; maxQueuedBytes: number;
@@ -164,7 +164,7 @@ export interface PeerConnection { transport: WebRTCTransport; peerConnection: RT
 export function createWebRTCPeer(options: PeerOptions): Promise<PeerConnection>;
 export interface RoomOptions { role: 'host' | 'join'; room?: string; namespace?: string; relays?: string[]; rtcConfig?: RTCConfiguration; timeoutMs?: number; onStatus?: (status: ConnectionStatus) => void; signal?: AbortSignal; signalerFactory?: typeof createNostrSignaler; peerFactory?: typeof createWebRTCPeer; }
 export function createNostrRoom(options: RoomOptions): Promise<PeerConnection & { room: string; sessionId: string; localPlayerId: string; remotePlayerId: string }>;
-export function createLoop(options: { session: RollbackSession; getInput?: () => Bytes; beforeFrame?: (timestamp: number) => void; canAdvance?: () => boolean; onAdvance?: (result: AdvanceResult) => void; maxWorkMs?: number; now?: () => number; render?: (context: { session: RollbackSession; alpha: number; resimulating: boolean }) => void; onError?: (error: unknown) => void; onInputRelease?: () => void; requestFrame?: (callback: FrameRequestCallback) => number; cancelFrame?: (handle: number) => void }): { start(): void; stop(): void; pulse(timestamp: number): void; resetTiming(): void; readonly running: boolean };
+export function createLoop(options: { session: RollbackSession; getInput?: () => Bytes; beforeFrame?: (timestamp: number) => void; canAdvance?: () => boolean; onAdvance?: (result: AdvanceResult) => void; render?: (context: { session: RollbackSession; alpha: number; resimulating: boolean }) => void; onError?: (error: unknown) => void; onInputRelease?: () => void; requestFrame?: (callback: FrameRequestCallback) => number; cancelFrame?: (handle: number) => void }): { start(): void; stop(): void; pulse(timestamp: number): void; resetTiming(): void; readonly running: boolean };
 export type CodecValue = null | boolean | number | string | Uint8Array | CodecValue[] | { [key: string]: CodecValue };
 export interface ValueCodec { readonly format: 'binary' | 'json'; encode(value: CodecValue): Uint8Array; decode(bytes: Bytes): CodecValue; }
 export function createValueCodec(options?: { format?: 'binary' | 'json'; maxBytes?: number; maxDepth?: number; maxEntries?: number }): ValueCodec;

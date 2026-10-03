@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createSession,profiles,WebRTCTransport,playReplay,hashBytes} from '../rollback-netcode.js';
+import {createLoop} from '../src/loop.js';
 
 function world(accept=true){
   const state=new Uint32Array(3),seen=[];
@@ -116,4 +117,30 @@ test('WebRTC channel closure and native connection interruption reach the status
   transport.subscribeStatus(s=>seen.push(s));transport.setConnectionState('disconnected');assert.equal(transport.state,'interrupted');
   transport.setConnectionState('connected');assert.equal(transport.state,'open');control.close();assert.equal(transport.state,'closed');
   assert.deepEqual(seen,['interrupted','open','closed']);transport.close();assert.equal(input.readyState,'closed');
+});
+test('costly polling does not postpone due ticks or queued commands',()=>{
+  const w=world(),session=createSession({players:['a'],localPlayerId:'a',sessionId:'costly-poll',simulationVersion:'1',inputSize:1,adapter:w.adapter,
+    profile:{...profiles.rts,baseInputDelayTicks:0,adaptiveInputDelay:false,pacingPolicy:'none'}});
+  const originalPoll=session.poll.bind(session);
+  let polls=0;
+  session.poll=(...args)=>{
+    const started=performance.now();
+    while(performance.now()-started<15) {}
+    polls++;
+    return originalPoll(...args);
+  };
+  const loop=createLoop({session,getInput:()=>new Uint8Array([1])});
+  try{
+    loop.pulse(0);
+    const quantum=1000/session.profile.tickRate;
+    for(let tick=1;tick<=5;tick++){
+      session.queueCommand(new Uint8Array([3]));
+      loop.pulse(tick*quantum);
+      assert.equal(session.tick,tick);
+      assert.equal(w.state[2],tick*3);
+    }
+    assert.ok(polls>=6);
+    assert.equal(w.state[1],5);
+    assert.equal(playReplay({adapter:world().adapter,replay:session.exportReplay()}).hash,session.getStateHash());
+  }finally{session.close()}
 });
