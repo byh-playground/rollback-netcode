@@ -4,6 +4,7 @@ export { createSession, RollbackSession, playReplay } from './core.js';
 export { WebRTCTransport, createWebRTCPeer } from './webrtc.js';
 export { createLoop } from './loop.js';
 export { createNostrRoom } from './room.js';
+export { createNostrGroupRoom } from './group-room.js';
 export { nostrCrypto } from './nostr-crypto.js';
 export { createNostrSignaler } from './nostr.js';
 export { createSyncTestSession, SyncTestSession, runSyncTest, runSyncTestAsync, DeterminismError } from './synctest.js';

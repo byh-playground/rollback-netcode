@@ -4,6 +4,47 @@
 
 현재 브랜치는 **0.2.0-dev 개발 후보**입니다. 공개 Pages는 main의 배포본을 제공하므로 후보 코드와 다를 수 있습니다. [검증 범위](docs/verification.md), [개발 계약 SSOT](CONTRACT.md), [공개 타입](rollback-netcode.d.ts)을 확인하세요.
 
+## N인 방: 풀메시와 방장 스타형
+
+이번 후보의 `createNostrGroupRoom`은 2~8명을 같은 API로 연결합니다. 기존 2인 `createNostrRoom`은 그대로 사용할 수 있습니다. 새 API가 공개 Pages에도 배포됐는지는 별도로 확인해야 합니다.
+
+```js
+import { createNostrGroupRoom, createSession, createLoop } from './rollback-netcode.js';
+const room = await createNostrGroupRoom({
+  role: 'host', // 참가자는 'join'과 같은 네 자리 room 번호 사용
+  playerCount: 4, topology: 'star', // 또는 'mesh'
+  namespace: 'my-game',
+  onStatus(event) {
+    if (event.type === 'room') showRoomCode(event.room);
+    if (event.type === 'group-members') showPlayers(event.players);
+    if (event.type === 'group-failed') showConnectionError(event.reason);
+  }
+});
+const session = createSession({
+  players: [...room.players], localPlayerId: room.localPlayerId,
+  authorityPlayerId: room.authorityPlayerId,
+  sessionId: room.sessionId, simulationVersion: 'my-game-v1',
+  inputSize: 1, adapter: gameAdapter
+});
+for (const [peerId, transport] of room.transports) session.attachTransport(peerId, transport);
+const loop = createLoop({ session, getInput, render });
+loop.start();
+// 종료: loop.stop(); session.close(); room.close();
+```
+
+참가자는 `createNostrGroupRoom({role:'join',room:'1234',playerCount:4,topology:'star',namespace:'my-game'})`처럼 같은 인원·토폴로지를 지정합니다. 정확히 지정한 인원이 모이고 모든 물리 연결과 시작 합의가 끝나면 Promise가 완료됩니다. 기본 제한 시간은 전체 형성 과정 60초이며 `timeoutMs`로 최대 120초까지 설정할 수 있습니다. `AbortSignal`로 대기를 취소할 수 있습니다. 초기 상태·규칙·시드 일치는 이어지는 Core handshake가 검사합니다.
+
+| 구성 | 물리 연결 수 | 클라이언트별 연결 | 특성 |
+| --- | ---: | --- | --- |
+| 풀메시 `mesh` | N×(N−1)/2 | 각 N−1개 | 직접 전달, 연결 수 증가 |
+| 방장 스타 `star` | N−1 | 방장 N−1개, 게스트 1개 | 중계 지연과 방장 전송·CPU 부담 추가 |
+
+`room.transports`는 두 방식 모두 상대별 논리 Transport이고 `room.peerConnections`는 실제 물리 연결만 담습니다. 스타에서도 각 피어가 같은 게임 상태를 계산하며 기존 Core를 재사용합니다. `room.metrics`는 스타의 전달 프레임·거부 프레임·대기 큐·조립 bytes를 제공하고, 풀메시에서는 `null`입니다. Session의 RTT는 스타에서 중계 경로를 포함합니다.
+
+경기 명단은 고정입니다. 진행 중 참가와 방장 자동 승계는 제공하지 않으며, 확정된 참가자가 완전히 나가면 방 종료를 알려야 합니다. 일시 interruption은 Core 상태로 구별합니다. API 결과의 ID는 기존 2인 예제의 `'a'/'b'` 대신 참가자 공개 키이므로 게임이 반환된 명단을 사용해야 합니다. 네 자리 번호는 비밀번호가 아닙니다.
+
+기여자는 `node scripts/group-browser-serve.mjs`로 검사 화면을 열어 2·3·4·8인 양쪽 토폴로지를 재현할 수 있습니다. 실제 RTC로 지연·손실, 큰 스냅샷 복구, 명령 중복, 상태 수렴과 리플레이를 검사합니다. 시그널링은 라이브러리의 실제 서명·검증을 쓰되 릴레이는 로컬 테스트 대역이며, 외부 NAT·공개 릴레이 가용성은 별도 검증 범위입니다.
+
 ## 한국어 예제 확인 순서
 
 [예제 화면](https://byh-playground.github.io/rollback-netcode/)에서 **이 화면에서 두 컴퓨터 검증 → 시작**을 누릅니다. 실제 RTC 연결 두 개로 플레이어 A·B의 이동과 점수 명령을 비교할 수 있습니다. 리플레이 확인, 개발자 상세의 고의 오류/복구, 연결 없이 결정론 검사도 제공합니다. 서로 다른 기기는 방 만들기/방 참가와 같은 네 자리 번호를 사용합니다.

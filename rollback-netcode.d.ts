@@ -147,7 +147,7 @@ export class WebRTCTransport implements Transport {
   subscribeStatus(listener: (state: TransportState) => void): () => void;
   setConnectionState(state: RTCPeerConnectionState): void; close(): void;
 }
-export interface SignalingMessage { type: 'discover' | 'presence' | 'offer' | 'answer' | 'ice' | 'bye'; [key: string]: unknown; }
+export interface SignalingMessage { type: 'discover' | 'presence' | 'offer' | 'answer' | 'ice' | 'bye' | 'group'; [key: string]: unknown; }
 export interface SignalEnvelope { from: string; to: string; message: SignalingMessage; }
 export interface Signaler { readonly id: string; send(to: string,message: SignalingMessage): Promise<void>; subscribe(listener: (event: SignalEnvelope) => unknown): () => void; close(): void; }
 export interface ConnectionStatus { type: string; state?: string; status?: string; error?: unknown; room?: string; role?: string; relay?: string; message?: string; }
@@ -164,6 +164,32 @@ export interface PeerConnection { transport: WebRTCTransport; peerConnection: RT
 export function createWebRTCPeer(options: PeerOptions): Promise<PeerConnection>;
 export interface RoomOptions { role: 'host' | 'join'; room?: string; namespace?: string; relays?: string[]; rtcConfig?: RTCConfiguration; timeoutMs?: number; onStatus?: (status: ConnectionStatus) => void; signal?: AbortSignal; signalerFactory?: typeof createNostrSignaler; peerFactory?: typeof createWebRTCPeer; }
 export function createNostrRoom(options: RoomOptions): Promise<PeerConnection & { room: string; sessionId: string; localPlayerId: string; remotePlayerId: string }>;
+export type RoomTopology = 'mesh' | 'star';
+export interface GroupRoomStatus extends ConnectionStatus {
+  type: string; room?: string; role?: 'host' | 'join'; playerCount?: number; topology?: RoomTopology;
+  phase?: string; players?: readonly PlayerId[]; localPlayerId?: PlayerId; peerId?: PlayerId;
+  reason?: string; previousPhase?: string; event?: ConnectionStatus;
+}
+export interface GroupRoomOptions {
+  role: 'host' | 'join'; room?: string; playerCount?: number; topology?: RoomTopology;
+  namespace?: string; relays?: string[]; rtcConfig?: RTCConfiguration; timeoutMs?: number;
+  onStatus?: (status: GroupRoomStatus) => void; signal?: AbortSignal;
+  signalerFactory?: typeof createNostrSignaler; peerFactory?: typeof createWebRTCPeer;
+}
+export interface GroupRoom {
+  readonly room: string; readonly sessionId: string; readonly playerCount: number; readonly topology: RoomTopology;
+  readonly players: readonly PlayerId[]; readonly localPlayerId: PlayerId;
+  readonly authorityPlayerId: PlayerId; readonly hostPlayerId: PlayerId;
+  /** Logical remote peers, including relayed guest-to-guest routes in star topology. */
+  readonly transports: ReadonlyMap<PlayerId, Transport>;
+  /** Physical connections only: N-1 per mesh/host, one per star guest. */
+  readonly peerConnections: ReadonlyMap<PlayerId, RTCPeerConnection>;
+  readonly closed: boolean;
+  readonly metrics: Readonly<{ sentFrames: number; forwardedFrames: number; rejectedFrames: number;
+    queuedBytes: number; queuedFrames: number; assemblyBytes: number }> | null;
+  close(): void;
+}
+export function createNostrGroupRoom(options: GroupRoomOptions): Promise<GroupRoom>;
 export function createLoop(options: { session: RollbackSession; getInput?: () => Bytes; beforeFrame?: (timestamp: number) => void; canAdvance?: () => boolean; onAdvance?: (result: AdvanceResult) => void; render?: (context: { session: RollbackSession; alpha: number; resimulating: boolean }) => void; onError?: (error: unknown) => void; onInputRelease?: () => void; requestFrame?: (callback: FrameRequestCallback) => number; cancelFrame?: (handle: number) => void }): { start(): void; stop(): void; pulse(timestamp: number): void; resetTiming(): void; readonly running: boolean };
 export type CodecValue = null | boolean | number | string | Uint8Array | CodecValue[] | { [key: string]: CodecValue };
 export interface ValueCodec { readonly format: 'binary' | 'json'; encode(value: CodecValue): Uint8Array; decode(bytes: Bytes): CodecValue; }

@@ -1293,7 +1293,7 @@ export const nostrCrypto = Object.freeze({
 // src/nostr.js
 const nostrHex32 = /^[0-9a-f]{64}$/;
 const nostrHex64 = /^[0-9a-f]{128}$/;
-const nostrSignalTypes = new Set(['discover', 'presence', 'offer', 'answer', 'ice', 'bye']);
+const nostrSignalTypes = new Set(['discover', 'presence', 'offer', 'answer', 'ice', 'bye', 'group']);
 const nostrContentLimit = 128 * 1024;
 const nostrFreshSeconds = 120;
 const nostrFutureSeconds = 30;
@@ -1558,7 +1558,7 @@ export async function createNostrSignaler({
     async send(nostrTo, nostrMessage) {
       if (nostrClosed) throw new Error('Nostr signaler closed');
       if (nostrTo !== '*' && (typeof nostrTo !== 'string' || !nostrHex32.test(nostrTo))) throw new TypeError('Nostr recipient must be a lowercase public key or *');
-      if (!nostrIsSignalMessage(nostrMessage)) throw new TypeError('Nostr carries discovery, presence, offer, answer, ice and bye signaling only');
+      if (!nostrIsSignalMessage(nostrMessage)) throw new TypeError('Nostr carries discovery, presence, offer, answer, ice, bye and group signaling only');
       if (nostrSending >= 64) throw new Error('Too many pending Nostr publications');
       if (!nostrStates.some(nostrState => nostrState.ready && !nostrState.failed && nostrState.socket.readyState === 1)) throw new Error('No live Nostr relays');
       nostrSending++;
@@ -1701,6 +1701,345 @@ export async function createNostrRoom({ role, room, namespace = 'rollback-netcod
     if (disposed) return;
     if (checking) collisionTimer = setTimeout(() => { checking = false; advertise(); }, 1200);
     else advertise();
+  });
+}
+
+// src/star-transport.js
+const starHeader = 24, starPayload = CHUNK_SIZE - starHeader, starMagic = 0x31535452;
+/** Logical peer transports over one physical host link per guest. Owns framing, not game state. */
+function createStarTransports({ players, localPlayerId, hostPlayerId, sessionId, physicalTransports,
+  onError = () => {}, maxQueuedBytes = 5 * 1024 * 1024 } = {}) {
+  if (!Array.isArray(players) || players.length < 2 || players.length > 8 || new Set(players).size !== players.length ||
+      !players.includes(localPlayerId) || !players.includes(hostPlayerId) || typeof sessionId !== 'string' ||
+      !(physicalTransports instanceof Map) || typeof onError !== 'function') throw new TypeError('star transport configuration');
+  integer(maxQueuedBytes, 'star queue budget', CHUNK_SIZE * 2, 64 * 1024 * 1024);
+  const local = players.indexOf(localPlayerId), host = players.indexOf(hostPlayerId), isHost = local === host;
+  const required = isHost ? players.filter(id => id !== localPlayerId) : [hostPlayerId];
+  if (required.some(id => !physicalTransports.get(id)?.subscribe || !physicalTransports.get(id)?.send)) throw new TypeError('missing star physical transport');
+  const tag = hashBytes(new TextEncoder().encode(sessionId)), listeners = new Map(), statusListeners = new Map();
+  const queues = new Map(required.map(id => [id, []])), assemblies = new Map(), completed = new Map();
+  const unsubs = [], stats = { sentFrames: 0, forwardedFrames: 0, rejectedFrames: 0, queuedBytes: 0, queuedFrames: 0, assemblyBytes: 0 };
+  let closed = false, sequence = 0, pumping = false;
+  function reject() { stats.rejectedFrames++; }
+  function close() {
+    if (closed) return; closed = true; clearInterval(timer);
+    for (const remove of unsubs.splice(0)) remove();
+    queues.forEach(q => q.length = 0); assemblies.clear(); completed.clear();
+    stats.queuedBytes = 0; stats.queuedFrames = 0; stats.assemblyBytes = 0;
+    for (const set of statusListeners.values()) for (const fn of set) { try { fn('closed'); } catch {} }
+    listeners.clear(); statusListeners.clear();
+  }
+  function fail(message) { if (closed) return; close(); try { onError(new Error(message)); } catch {} }
+  function pump() {
+    if (closed || pumping) return; pumping = true;
+    try {
+      const now = nowMs();
+      for (const [id, q] of queues) {
+        let work = 0;
+        while (q.length && work++ < 128 && !closed) {
+          if (now - q[0].at > 10000) { fail('star forwarding backpressure timeout'); break; }
+          if (physicalTransports.get(id).send(q[0].bytes) === false) break;
+          stats.queuedBytes -= q.shift().bytes.length; stats.queuedFrames--; stats.sentFrames++;
+        }
+      }
+      for (const [key, a] of assemblies) if (now - a.at > 2000) { assemblies.delete(key); stats.assemblyBytes -= a.total; }
+    } catch (error) { fail('star forwarding failed: ' + error.message); }
+    finally { pumping = false; }
+  }
+  function enqueue(id, frames, forwarded) {
+    const size = frames.reduce((n, b) => n + b.length, 0), q = queues.get(id);
+    if (closed || !q || (physicalTransports.get(id).state && physicalTransports.get(id).state !== 'open')) return false;
+    if (stats.queuedBytes + size > maxQueuedBytes || stats.queuedFrames + frames.length > 4096) { if (forwarded) fail('star forwarding queue capacity'); return false; }
+    const at = nowMs(); for (const b of frames) q.push({ bytes: b.slice(), at });
+    stats.queuedBytes += size; stats.queuedFrames += frames.length; if (forwarded) stats.forwardedFrames += frames.length;
+    pump(); return !closed;
+  }
+  function deliver(from, id, payload, lane) {
+    const actualLane = payload.length > 5 && [TYPE.INPUT, TYPE.CLOCK].includes(payload[5]) ? payload[5] : 1;
+    if (actualLane !== lane) { reject(); return; }
+    let seen = completed.get(from); if (!seen) completed.set(from, seen = new Set());
+    if (seen.has(id)) return; seen.add(id); if (seen.size > 256) seen.delete(seen.values().next().value);
+    const target = listeners.get(players[from]);
+    if (target?.size) for (const fn of target) fn(payload.slice());
+    // Core HELLO/input retransmission owns delivery before a consumer subscribes.
+  }
+  function receive(physicalId, data) {
+    if (closed) return;
+    let b; try { b = bytes(data); } catch { reject(); return; }
+    if (b.length < starHeader || b.length > CHUNK_SIZE) { reject(); return; }
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength), from = b[6], to = b[7], lane = b[5];
+    const id = v.getUint32(12, true), total = v.getUint16(16, true), offset = v.getUint16(18, true), length = v.getUint16(20, true);
+    if (v.getUint32(0, true) !== starMagic || b[4] !== 1 || v.getUint32(8, true) !== tag ||
+        v.getUint16(22, true) !== 0 || ![1, TYPE.INPUT, TYPE.CLOCK].includes(lane) ||
+        from >= players.length || to >= players.length || from === to || from === local ||
+        !id || !total || total > CHUNK_SIZE || ![0, starPayload].includes(offset) || offset >= total ||
+        length !== Math.min(starPayload, total - offset) || b.length !== starHeader + length ||
+        (isHost ? players[from] !== physicalId : physicalId !== hostPlayerId || to !== local)) { reject(); return; }
+    if (to !== local) { if (!isHost || !enqueue(players[to], [b], true)) { if (!closed) fail('star destination is not available'); } return; }
+    if (completed.get(from)?.has(id)) return;
+    if (total <= starPayload) { deliver(from, id, b.slice(starHeader), lane); return; }
+    const key = from + ':' + id; let a = assemblies.get(key);
+    if (!a) {
+      if (assemblies.size >= 32 || stats.assemblyBytes + total > 512 * 1024) { reject(); return; }
+      a = { total, lane, bytes: new Uint8Array(total), seen: new Set(), at: nowMs() }; assemblies.set(key, a); stats.assemblyBytes += total;
+    }
+    if (a.total !== total || a.lane !== lane) { reject(); return; }
+    if (a.seen.has(offset)) {
+      for (let i = 0; i < length; i++) if (a.bytes[offset + i] !== b[starHeader + i]) { reject(); return; }
+      return;
+    }
+    a.bytes.set(b.subarray(starHeader), offset); a.seen.add(offset);
+    if (a.seen.size === 2) { assemblies.delete(key); stats.assemblyBytes -= total; deliver(from, id, a.bytes, lane); }
+  }
+  const timer = setInterval(pump, 16); timer.unref?.();
+  const transports = new Map();
+  for (const remote of players.filter(id => id !== localPlayerId)) {
+    listeners.set(remote, new Set()); statusListeners.set(remote, new Set());
+    const physical = isHost ? remote : hostPlayerId;
+    transports.set(remote, {
+      get state() { return closed ? 'closed' : physicalTransports.get(physical).state ?? 'open'; },
+      send(data) {
+        if (closed) return false; const payload = bytes(data);
+        if (!payload.length || payload.length > CHUNK_SIZE) throw new RangeError('star packet size');
+        sequence = (sequence + 1) >>> 0 || 1; const id = sequence, frames = [];
+        const lane = payload.length > 5 && [TYPE.INPUT, TYPE.CLOCK].includes(payload[5]) ? payload[5] : 1;
+        for (let offset = 0; offset < payload.length; offset += starPayload) {
+          const length = Math.min(starPayload, payload.length - offset), b = new Uint8Array(starHeader + length), v = new DataView(b.buffer);
+          v.setUint32(0, starMagic, true); b[4] = 1; b[5] = lane; b[6] = local; b[7] = players.indexOf(remote);
+          v.setUint32(8, tag, true); v.setUint32(12, id, true); v.setUint16(16, payload.length, true);
+          v.setUint16(18, offset, true); v.setUint16(20, length, true); b.set(payload.subarray(offset, offset + length), starHeader); frames.push(b);
+        }
+        return enqueue(physical, frames, false);
+      },
+      subscribe(fn) { if (closed || typeof fn !== 'function') throw new TypeError('star subscriber'); const set = listeners.get(remote); set.add(fn); return () => set.delete(fn); },
+      subscribeStatus(fn) { if (closed || typeof fn !== 'function') throw new TypeError('star status subscriber'); const set = statusListeners.get(remote); set.add(fn); return () => set.delete(fn); },
+      close() { listeners.get(remote)?.clear(); statusListeners.get(remote)?.clear(); }
+    });
+  }
+  try { for (const id of required) {
+    const raw = physicalTransports.get(id);
+    unsubs.push(raw.subscribe(data => receive(id, data)));
+    if (raw.subscribeStatus) unsubs.push(raw.subscribeStatus(state => {
+      for (const [remote, set] of statusListeners) if (!isHost || remote === id) for (const fn of set) { try { fn(state); } catch {} }
+    }));
+  } } catch (error) { close(); throw error; }
+  return { transports, close, get metrics() { return { ...stats }; } };
+}
+
+// src/group-room.js
+function groupRoomId(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value); }
+/** Fixed-roster 2..8-player room. Topology changes transports, never the simulation Core. */
+export async function createNostrGroupRoom({ role, room, playerCount = 2, topology = 'mesh', namespace = 'rollback-netcode',
+  relays, rtcConfig, timeoutMs = 60000, onStatus = () => {}, signal,
+  signalerFactory = createNostrSignaler, peerFactory = createWebRTCPeer } = {}) {
+  if (!['host', 'join'].includes(role) || !['mesh', 'star'].includes(topology)) throw new TypeError('group room role/topology');
+  integer(playerCount, 'playerCount', 2, 8); integer(timeoutMs, 'timeoutMs', 1, 120000);
+  if (typeof namespace !== 'string' || !namespace.trim() || new TextEncoder().encode(namespace + ':group-v1').length > 128) throw new TypeError('group namespace');
+  if ([onStatus, signalerFactory, peerFactory].some(fn => typeof fn !== 'function')) throw new TypeError('group room capability');
+  if (signal?.aborted) throw new Error('group room aborted');
+  const random = () => [...globalThis.crypto.getRandomValues(new Uint8Array(16))].map(v => v.toString(16).padStart(2, '0')).join('');
+  if (!room && role === 'host') room = String(globalThis.crypto.getRandomValues(new Uint32Array(1))[0] % 10000).padStart(4, '0');
+  if (!/^\d{4}$/.test(room ?? '')) throw new TypeError('four-digit room');
+  const peerController = new AbortController(), signalController = new AbortController(), startedAt = nowMs();
+  const earlyAbort = () => { peerController.abort(); signalController.abort(); };
+  signal?.addEventListener('abort', earlyAbort, { once: true });
+  let signaler;
+  try {
+    signaler = await signalerFactory({ room, namespace: namespace + ':group-v1', relays, signal: signalController.signal,
+      timeoutMs: Math.min(timeoutMs, 10000), onStatus,
+      maxVerificationsPerSecond: Math.max(16, playerCount * 4), verificationBurst: playerCount * 4 });
+    if (!groupRoomId(signaler?.id) || typeof signaler.send !== 'function' || typeof signaler.subscribe !== 'function' || typeof signaler.close !== 'function') throw new TypeError('group signaler capability');
+    if (signal?.aborted || signalController.signal.aborted) throw new Error('group room aborted');
+  } catch (error) { earlyAbort(); signaler?.close?.(); signal?.removeEventListener('abort', earlyAbort); throw error; }
+  signal?.removeEventListener('abort', earlyAbort);
+
+  return new Promise((resolve, reject) => {
+    const self = signaler.id, members = new Set([self]), departed = new Set(), acks = new Set([self]), ready = new Set(), starts = new Set([self]);
+    const peers = new Map(), subscribers = new Map(), backlog = new Map(), controlPending = new Map(), removers = [];
+    let host = role === 'host' ? self : null, sessionId = role === 'host' ? random() : null, roster = null, rosterKey = '';
+    let phase = role === 'host' ? 'checking' : 'discovering', disposed = false, settled = false, connecting = false, localReady = false;
+    let unsubscribe, interval, collisionTimer, deadline, router, backlogBytes = 0, startPublished = false;
+    const status = (type, detail = {}) => { try { onStatus({ type, room, role, playerCount, topology, phase, ...detail }); } catch {} };
+    function message(op, extra = {}) { return { type: 'group', version: 1, protocol: PROTOCOL_VERSION, op, host, sessionId, playerCount, topology, ...extra }; }
+    function dispose(reason, notify = true) {
+      if (disposed) return; disposed = true;
+      clearInterval(interval); clearTimeout(collisionTimer); clearTimeout(deadline);
+      unsubscribe?.(); signal?.removeEventListener('abort', abort);
+      peerController.abort(); removers.splice(0).forEach(fn => fn()); router?.close();
+      peers.forEach(p => p.close()); peers.clear(); subscribers.clear(); backlog.clear(); backlogBytes = 0;
+      // Give a departure publication a bounded grace period; RTC closes immediately.
+      const finish = () => { signalController.abort(); signaler.close(); };
+      if (notify && host && sessionId) {
+        const grace = setTimeout(finish, 1500); grace.unref?.();
+        Promise.resolve().then(() => signaler.send(role === 'host' ? '*' : host, message('leave', { reason })))
+          .catch(() => {}).finally(() => { clearTimeout(grace); finish(); });
+      } else finish();
+    }
+    function fail(error, notify = true) {
+      if (disposed) return; const value = error instanceof Error ? error : new Error(String(error));
+      const former = phase; phase = 'failed'; dispose(value.message, notify);
+      status('group-failed', { reason: value.message, previousPhase: former });
+      if (!settled) { settled = true; reject(value); }
+    }
+    function abort() { fail(new Error('group room aborted')); }
+    function send(to, op, extra = {}) {
+      if (disposed) return Promise.resolve();
+      const key = to + ':' + op; if (controlPending.has(key)) return controlPending.get(key);
+      if (controlPending.size >= 32) return Promise.resolve();
+      const pending = Promise.resolve().then(() => { if (!disposed) return signaler.send(to, message(op, extra)); })
+        .catch(error => { fail(error); }).finally(() => controlPending.delete(key));
+      controlPending.set(key, pending); return pending;
+    }
+    function close() {
+      if (disposed) return; const pending = !settled; phase = 'closed'; dispose('room closed'); status('group-closed');
+      if (pending) { settled = true; reject(new Error('group room closed')); }
+    }
+    function finish() {
+      if (disposed || settled || !localReady) return;
+      settled = true; phase = 'running'; clearTimeout(deadline); clearInterval(interval);
+      const physical = new Map([...peers].map(([id, peer]) => [id, peer.transport]));
+      status('group-started', { players: [...roster], localPlayerId: self });
+      // A status observer is allowed to close/abort before the result is exposed.
+      if (disposed) { reject(new Error('group room closed by observer')); return; }
+      resolve({ room, sessionId, playerCount, topology, players: Object.freeze([...roster]), localPlayerId: self,
+        authorityPlayerId: host, hostPlayerId: host,
+        transports: new Map(router?.transports ?? physical),
+        peerConnections: new Map([...peers].map(([id, peer]) => [id, peer.peerConnection])),
+        get closed() { return disposed; }, get metrics() { return router?.metrics ?? null; }, close });
+    }
+    function hostProgress() {
+      if (disposed || role !== 'host' || !roster) return;
+      if (phase === 'roster' && acks.size === playerCount) { phase = 'connecting'; connect(); send('*', 'connect', { rosterKey }); }
+      if (phase === 'connecting' && ready.size === playerCount) {
+        phase = 'starting'; send('*', 'start', { rosterKey }).then(() => { startPublished = true; hostProgress(); });
+      }
+      if (phase === 'starting' && startPublished && starts.size === playerCount) finish();
+    }
+    function wantedPeers() { return roster.filter(id => id !== self && (topology === 'mesh' || self === host || id === host)); }
+    function scopedSignaler(remote) {
+      return { id: self,
+        send(to, payload) {
+          if (disposed || to !== remote) return Promise.reject(new Error('group peer scope'));
+          return signaler.send(to, { ...payload, groupSession: sessionId });
+        },
+        subscribe(fn) {
+          const set = subscribers.get(remote) ?? new Set(); subscribers.set(remote, set); set.add(fn);
+          const queued = backlog.get(remote) ?? []; backlog.delete(remote);
+          for (const item of queued) { backlogBytes -= item.size; if (!disposed) fn(item.envelope); }
+          return () => set.delete(fn);
+        }, close() {}
+      };
+    }
+    function connect() {
+      if (disposed || connecting || !roster) return; connecting = true; phase = 'connecting';
+      status('group-connecting', { players: [...roster] }); if (disposed) return;
+      Promise.all(wantedPeers().map(remote => Promise.resolve().then(() => {
+        if (disposed) throw new Error('group room closed');
+        return peerFactory({ initiator: compareIds(self, remote) > 0, signaler: scopedSignaler(remote), remoteId: remote,
+          rtcConfig, timeoutMs: Math.min(timeoutMs, 30000), onStatus: event => status('group-peer', { peerId: remote, event }), signal: peerController.signal });
+      }).then(peer => {
+        if (disposed) { peer.close(); return; }
+        if (!peer?.transport?.send || !peer.transport.subscribe || typeof peer.close !== 'function') throw new TypeError('group peer capability');
+        peers.set(remote, peer);
+        if (peer.transport.subscribeStatus) removers.push(peer.transport.subscribeStatus(state => {
+          if (!disposed && (state === 'closed' || state === 'failed' || (!settled && state === 'interrupted'))) fail(new Error('group peer unavailable: ' + remote));
+        }));
+      }))).then(() => {
+        if (disposed) return;
+        if ([...peers.values()].some(p => p.transport.state && p.transport.state !== 'open')) throw new Error('group transport not open');
+        if (topology === 'star') router = createStarTransports({ players: roster, localPlayerId: self, hostPlayerId: host, sessionId,
+          physicalTransports: new Map([...peers].map(([id, p]) => [id, p.transport])), onError: fail });
+        localReady = true; status('group-ready', { players: [...roster] }); if (disposed) return;
+        if (role === 'host') { ready.add(self); hostProgress(); } else send(host, 'ready', { rosterKey });
+      }).catch(fail);
+    }
+    function publishRoster() { send('*', 'roster', { players: roster, rosterKey }); }
+    function advertise(to = '*') { send(to, 'hello', { accepting: phase === 'collecting', memberCount: members.size }); }
+    function acceptRoster(from, m) {
+      if (from !== host || !Array.isArray(m.players) || m.players.length !== playerCount ||
+          m.players.some(id => !groupRoomId(id)) || new Set(m.players).size !== playerCount ||
+          !m.players.includes(self) || !m.players.includes(host) || m.players.join('\n') !== [...m.players].sort(compareIds).join('\n') ||
+          m.rosterKey !== m.players.join('\n')) { fail(new Error('invalid group roster')); return; }
+      if (roster && rosterKey !== m.rosterKey) { fail(new Error('group roster changed')); return; }
+      if (!roster) { roster = Object.freeze([...m.players]); rosterKey = m.rosterKey; phase = 'roster'; status('group-roster', { players: [...roster] }); }
+      send(host, 'ack', { rosterKey });
+    }
+    function receive(envelope) {
+      if (disposed || !envelope || envelope.from === self || !groupRoomId(envelope.from) ||
+          !['*', self].includes(envelope.to) || !envelope.message || typeof envelope.message !== 'object') return;
+      const { from, to, message: m } = envelope;
+      if (['offer', 'answer', 'ice', 'bye'].includes(m.type)) {
+        if (!roster || to !== self || m.groupSession !== sessionId || !wantedPeers().includes(from)) return;
+        const set = subscribers.get(from);
+        if (set?.size) { for (const fn of set) fn(envelope); return; }
+        const size = encoder.encode(JSON.stringify(m)).length, queued = backlog.get(from) ?? [];
+        if (queued.length >= 32 || backlogBytes + size > 2 * 1024 * 1024) { fail(new Error('group signaling backlog capacity')); return; }
+        queued.push({ envelope, size }); backlog.set(from, queued); backlogBytes += size; return;
+      }
+      if (m.type !== 'group' || m.version !== 1 || m.protocol !== PROTOCOL_VERSION) return;
+      if (role === 'host' && m.op === 'hello' && m.host === from) {
+        if (['checking', 'collecting'].includes(phase)) fail(new Error('room code is already in use'));
+        else if (m.accepting !== false) advertise(from);
+        return;
+      }
+      if (role === 'join' && m.op === 'hello' && m.host === from && groupRoomId(m.sessionId)) {
+        if (host && (host !== from || sessionId !== m.sessionId)) return;
+        if (m.playerCount !== playerCount || m.topology !== topology) { fail(new Error('group playerCount/topology mismatch'), false); return; }
+        const selected = !!host;
+        if (!host) { host = from; sessionId = m.sessionId; }
+        if (!roster) { if (m.accepting === false && !selected) { fail(new Error('group room is full or already started'), false); return; } send(host, 'join'); }
+        return;
+      }
+      if (role === 'host' && m.op === 'discover') { if (phase !== 'checking') advertise(from); return; }
+      if (m.host !== host || m.sessionId !== sessionId || m.playerCount !== playerCount || m.topology !== topology) return;
+      if (role === 'host') {
+        if (m.op === 'join') {
+          if (members.has(from)) { if (roster) publishRoster(); return; }
+          if (phase !== 'collecting' || departed.has(from)) { send(from, 'reject', { reason: 'group room is full or already started' }); return; }
+          members.add(from); status('group-members', { players: [...members].sort(compareIds) });
+          if (disposed) return;
+          if (members.size === playerCount) { roster = Object.freeze([...members].sort(compareIds)); rosterKey = roster.join('\n'); phase = 'roster'; status('group-roster', { players: [...roster] }); publishRoster(); }
+        } else if (m.op === 'leave' && members.has(from)) {
+          if (phase === 'collecting') { members.delete(from); departed.add(from); if (departed.size > 64) fail(new Error('group membership churn limit')); else status('group-members', { players: [...members].sort(compareIds) }); }
+          else fail(new Error('group participant left'));
+        } else if (roster?.includes(from) && m.rosterKey === rosterKey) {
+          if (m.op === 'ack') acks.add(from);
+          if (m.op === 'ready' && ['connecting', 'starting'].includes(phase)) ready.add(from);
+          if (m.op === 'start-ack' && phase === 'starting') starts.add(from);
+          hostProgress();
+        }
+      } else if (from === host) {
+        if (m.op === 'reject') fail(new Error(String(m.reason || 'group rejected')), false);
+        else if (m.op === 'leave') fail(new Error('group host left'), false);
+        else if (m.op === 'roster') acceptRoster(from, m);
+        else if (roster && m.rosterKey === rosterKey) {
+          if (m.op === 'connect') { connect(); if (localReady) send(host, 'ready', { rosterKey }); }
+          if (m.op === 'start' && localReady) send(host, 'start-ack', { rosterKey }).then(finish);
+        }
+      }
+    }
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    unsubscribe = signaler.subscribe(receive);
+    if (disposed) { unsubscribe?.(); return; }
+    const remaining = timeoutMs - (nowMs() - startedAt);
+    if (remaining <= 0) { fail(new Error('group room timeout')); return; }
+    deadline = setTimeout(() => fail(new Error('group room timeout: ' + phase)), remaining);
+    interval = setInterval(() => {
+      if (disposed) return;
+      if (role === 'host') {
+        if (phase === 'collecting') advertise();
+        else if (phase === 'roster') publishRoster();
+        else if (phase === 'connecting') send('*', 'connect', { rosterKey });
+        else if (phase === 'starting') send('*', 'start', { rosterKey }).then(() => { startPublished = true; hostProgress(); });
+      } else if (!host) send('*', 'discover');
+      else if (!roster) send(host, 'join');
+      else if (!connecting) send(host, 'ack', { rosterKey });
+      else if (localReady) send(host, 'ready', { rosterKey });
+    }, 1000);
+    status('room'); if (disposed) return;
+    if (role === 'host') collisionTimer = setTimeout(() => { if (!disposed) { phase = 'collecting'; advertise(); } }, 1200);
+    else send('*', 'discover');
   });
 }
 
