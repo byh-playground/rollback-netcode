@@ -147,7 +147,7 @@ window.harness = {
       players: ids, localPlayerId, sessionId: 'browser-real-webrtc', simulationVersion: 'integer-v1', seed: 17, inputSize: 1,
       profile: { ...profiles.action, tickRate: 60, baseInputDelayTicks: 0, minInputDelayTicks: 0, maxInputDelayTicks: 8,
         adaptiveInputDelay: false, pacingPolicy: 'none', rollbackWindowTicks: 12, stateHistorySize: 40,
-        checksumInterval: 8, resimulationBudget: 64, maxCatchupSteps: 64 },
+        checksumInterval: 8, maxCatchupSteps: 64 },
       adapter: adapterFor(state, true), onEvent: event => events.push(event),
     });
     const transport = new WebRTCTransport({ inputChannel, controlChannel, highWaterMark: 262144, lowWaterMark: 65536 });

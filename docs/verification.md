@@ -93,3 +93,12 @@ fixed-point 100,000회 제한 범위 곱셈은 BigInt 기준 22.99ms, 안전 정
 
 `exportSyncTestFrames({maxFrames})`가 첫 확정 기록을 최대 256개만 독립 복사하도록 추가했습니다. 긴 전체 replay를 복사 후 slice하지 않으며 선택되지 않은 frame의 inputs getter를 실행하면 throw하는 검사로 범위 밖 복사를 하지 않는 것을 확인했습니다. 잘린 기록 뒤 frame은 생성하지 않고 initialTick 0을 제공합니다. Synctest 시간은 mandatory forward restore가 성공하거나 throw해도 포함하도록 옮겼습니다. batch 초기 save/final restore와 async yield 대기는 범위 밖입니다. 비동기 양보는 **tick 경계**에서 하며 한 advance 안의 checkDistance 재실행은 여전히 동기입니다.
 - 보완 최종 검사: 전체 자동 **96개 PASS**, strict TypeScript PASS, 실제 브라우저 bounded prefix 독립 복사와 async heartbeat PASS, 두 RTC 240 tick 최종 hash 1728421543 일치 PASS. 원래 동기 진단 후보의 1초 interruption 결과는 이 보완의 최종 PASS 범위에 포함하지 않습니다.
+
+
+## 2026-10-03 동기 롤백·복구
+
+롤백/복구 재실행의 호출별 분할과 createLoop의 12ms 등 시간 예산 게이트를 제거했습니다. 이전 현재 틱까지 같은 호출에서 재계산하며, 예측 윈도우와 패킷 청크·메모리 상한은 유지합니다. 시뮬레이션은 DOM/렌더링과 분리하고 어댑터 재실행 플래그로 표현 부수 효과를 분리하는 계약을 유지합니다. 앞서 실험한 명령 배치 주기/개수 및 재송신 후보는 이번 변경에 포함하지 않습니다.
+
+24틱보다 깊은 롤백을 단일 poll에서, 40틱 복구를 마지막 스냅샷 청크 수신 호출에서 완료하고 최종 상태/해시가 일치하는 회귀 검사를 추가했습니다. 손상 스냅샷과 어댑터 예외는 원래 상태와 이력을 보존합니다. poll이 15ms 이상 걸려도 정상 틱이 진행하고 리플레이 결과가 일치합니다. strict TypeScript 검사를 통과했습니다. 실제 Edge RTC 두 피어 240틱 hash 1728421543 일치, 최대 깊이12 재계산과 브라우저 오류0을 확인했습니다.
+
+동기 재실행은 완료할 때까지 호출을 점유합니다. CPU 총비용 개선이나 긴 작업 제거를 주장하지 않으며, 비용은 메트릭으로 관찰합니다. runSyncTestAsync의 명시적 비동기 진단 실행과 일반 wall-clock 따라잡기 상한은 라이브 경기의 롤백 분할과 별개입니다.

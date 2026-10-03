@@ -169,9 +169,9 @@ const snapshot = stateCodec.decode(bytes);
 
 ## 외부 렌더 루프와 진단 표시
 
-기존 requestAnimationFrame을 쓰는 앱은 `createLoop({ session, beforeFrame, canAdvance, onAdvance, render, maxWorkMs: 8 })`를 만들고 매 프레임 `loop.pulse(timestamp)`를 호출할 수 있습니다. 이때 `start()`는 호출하지 않습니다. `beforeFrame(timestamp)`에서 세션의 사용자 제공 clock을 해당 프레임 시각으로 갱신하면 poll과 advance가 같은 시간 기준을 사용합니다. `canAdvance()`는 새 논리 틱마다 확인하므로 승패나 앱 일시정지 뒤 추가 틱이 실행되지 않습니다. 대기 중에도 poll의 복구 작업과 render는 지속됩니다. 재시작/화면 전환 때 `resetTiming()`으로 누적 시간을 비웁니다. 자동 RAF의 start/stop과 입력 release 동작은 유지됩니다.
+기존 requestAnimationFrame을 쓰는 앱은 `createLoop({ session, beforeFrame, canAdvance, onAdvance, render })`를 만들고 매 프레임 `loop.pulse(timestamp)`를 호출할 수 있습니다. 이때 `start()`는 호출하지 않습니다. `beforeFrame(timestamp)`에서 세션의 사용자 제공 clock을 해당 프레임 시각으로 갱신하면 poll과 advance가 같은 시간 기준을 사용합니다. `canAdvance()`는 새 논리 틱마다 확인하므로 승패나 앱 일시정지 뒤 추가 틱이 실행되지 않습니다. 대기 중에도 poll의 복구 작업과 render는 지속됩니다. 재시작/화면 전환 때 `resetTiming()`으로 누적 시간을 비웁니다. 자동 RAF의 start/stop과 입력 release 동작은 유지됩니다.
 
-`maxWorkMs`는 poll을 포함한 프레임 경과 시간을 확인해 추가 advance를 제한하는 선택 예산입니다. 이미 시작한 동기 poll/step을 중단하지 않으며 Core의 resimulationBudget도 그대로 적용됩니다. `now()`는 실제 시간 측정용이며 논리 dt와 게임 규칙에는 전달하지 않습니다.
+롤백과 복구 재실행은 과거 상태에서 이전 현재 틱까지 한 호출 안에서 완료합니다. `resimulationBudget`, `createLoop`의 `maxWorkMs` 및 측정용 `now` 옵션은 제거했습니다. 시간 예산으로 정상 틱을 생략하거나 재실행을 여러 호출로 나누지 않습니다. 깊은 롤백은 완료할 때까지 호출을 점유하며, 메트릭은 그 실제 비용을 기록합니다.
 
 `SyncTestSession.metrics`는 읽기 전용 snapshot으로 status/tick/checkDistance/checkedTicks/resimulatedTicks/stateHash/historyBytes/failure와 SDK 내부에서 측정한 forwardCostMs/resimulationCostMs/totalCostMs를 제공합니다. 시간은 정상 step·직렬화와 재실행·비교 비용을 포함하고 필수 forward 상태 복구 load를 포함합니다. batch 전체의 초기 save와 최종 원상 복구 load, yield 대기는 제외합니다. UI에서 카운터나 hash를 별도로 계산할 필요가 없습니다. `runSyncTest`도 기존 tick/hash 필드와 함께 `metrics`를 반환하며 실패 시 던진 Error의 `syncTestMetrics`에서 같은 요약을 읽습니다. 실패 요약에는 전체 snapshot/input payload를 넣지 않습니다. 세션을 close하면 metrics의 historyBytes는 0, stateHash는 null입니다.
 

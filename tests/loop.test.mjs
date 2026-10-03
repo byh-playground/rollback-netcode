@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createLoop} from '../rollback-netcode.js';
+import {createLoop} from '../src/loop.js';
 function fixture(options={}){
   const events=[];let tick=0, clock=0;
   const session={inputSize:1,profile:{tickRate:20,maxCatchupSteps:5},metrics:{pace:1},closed:false,resimulating:false,
@@ -19,9 +19,11 @@ test('manual loop updates clock before polling, respects each terminal step and 
   assert.equal(f.events.filter(e=>e[0]==='render').length,3);
   allowed=true;f.loop.resetTiming();f.loop.pulse(1000);assert.equal(f.tick,1);f.loop.pulse(1050);assert.equal(f.tick,2);
 });
-test('loop limits elapsed CPU budget and caps accumulated catchup without changing dt',()=>{
-  let cost=0;const f=fixture({now:()=>cost,maxWorkMs:3,onAdvance:()=>{cost+=2}});
-  f.loop.pulse(0);f.loop.pulse(250);assert.equal(f.tick,2);f.loop.pulse(300);assert.equal(f.tick,4);
+test('loop executes due fixed ticks and caps accumulated wall-clock catchup',()=>{
+  const f=fixture();
+  f.loop.pulse(0);f.loop.pulse(250);assert.equal(f.tick,5);
+  f.loop.pulse(300);assert.equal(f.tick,6);
+  f.loop.pulse(10000);assert.equal(f.tick,11);
 });
 test('automatic RAF start/stop is idempotent and errors stop scheduling',()=>{
   const callbacks=new Map();let next=0,cancelled=0,error;
@@ -30,7 +32,7 @@ test('automatic RAF start/stop is idempotent and errors stop scheduling',()=>{
   callbacks.get(2)(NaN);assert.equal(f.loop.running,false);assert.match(error.message,/timestamp/);assert.equal(cancelled,1);
   const manual=fixture();assert.throws(()=>manual.loop.start(),/frame scheduler/);
 });
-test('loop rejects invalid scheduler budgets and callbacks',()=>{
-  const f=fixture();for(const maxWorkMs of [0,-1,NaN])assert.throws(()=>createLoop({session:f.session,maxWorkMs}),/maxWorkMs/);
+test('loop rejects invalid callbacks',()=>{
+  const f=fixture();
   assert.throws(()=>createLoop({session:f.session,canAdvance:false}),/callback/);
 });

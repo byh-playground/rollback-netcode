@@ -81,7 +81,6 @@ function makePair({ profile = {}, inputForTick = stream, acceptSnapshot, snapsho
     rollbackWindowTicks: 12,
     stateHistorySize: 32,
     checksumInterval: 8,
-    resimulationBudget: 64,
     maxCatchupSteps: 64,
     ...profile,
   };
@@ -234,34 +233,68 @@ test('a deep changed prediction restores S[t] and resimulates across a wrapped h
   } finally { pair.close(); }
 });
 
-test('partial resimulation consumes a bounded budget and does not add a logical tick', () => {
-  const pair = makePair({ profile: { resimulationBudget: 2 } });
+test('one poll replays a deep rollback completely to the original tick', () => {
+  const pair = makePair({ profile: { rollbackWindowTicks: 48, stateHistorySize: 96 } });
   try {
     drive(pair, 40);
     pair.link.setDeliveryEnabled(false);
-    for (let round = 0; round < 7; round++) {
+    for (let round = 0; round < 30; round++) {
+      pair.sessions.forEach((session, index) => session.advance(stream(IDS[index], session.tick)));
+      pair.link.pump();
+    }
+    assert.equal(pair.sessions[0].tick, 70);
+    pair.link.setDeliveryEnabled(true);
+    pair.link.pump();
+    assert.ok(pair.sessions[0].resimulating);
+    const observed = [];
+    const originalStep = pair.sims[0].adapter.step;
+    pair.sims[0].adapter.step = frame => {
+      observed.push([frame.resimulating, pair.sessions[0].resimulating, pair.sessions[0].status]);
+      originalStep(frame);
+    };
+    const onEvent = pair.sessions[0].onEvent;
+    pair.sessions[0].onEvent = event => {
+      if (event.type === 'rollback') observed.push([true, pair.sessions[0].resimulating, pair.sessions[0].status]);
+      onEvent(event);
+    };
+    const before = pair.sims[0].steps.length;
+    pair.sessions[0].poll(pair.link.now);
+    assert.equal(pair.sessions[0].tick, 70);
+    assert.equal(pair.sessions[0].resimulating, false);
+    assert.ok(pair.sims[0].steps.length - before > 24, 'rollback exceeds former default budget in one call');
+    assert.ok(pair.sims[0].steps.slice(before).every(step => step.resimulating));
+    assert.ok(observed.length > 24);
+    assert.ok(observed.every(row => row[0] && row[1] && row[2] === 'resimulating'));
+    assert.deepEqual([...pair.sims[0].state], oracle(70));
+    drive(pair, 90);
+    assertConverged(pair, 90);
+  } finally { pair.close(); }
+});
+
+test('a failed synchronous rollback clears the active replay flag', () => {
+  const pair = makePair();
+  try {
+    drive(pair, 20);
+    pair.link.setDeliveryEnabled(false);
+    for (let i = 0; i < 5; i++) {
       pair.sessions.forEach((session, index) => session.advance(stream(IDS[index], session.tick)));
       pair.link.pump();
     }
     pair.link.setDeliveryEnabled(true);
     pair.link.pump();
-    assert.ok(pair.sessions[0].resimulating);
-    const beforeAdvance = pair.sims[0].steps.length;
-    const result = pair.sessions[0].advance(stream('a', 47));
-    assert.equal(result.status, 'resimulating');
-    assert.ok(pair.sims[0].steps.length - beforeAdvance <= 2, 'one advance cannot exceed the two-tick resimulation budget');
-    let sawPartial = false;
-    for (let round = 0; round < 8 && pair.sessions[0].resimulating; round++) {
-      const before = pair.sims[0].steps.length;
-      pair.sessions[0].poll(pair.link.now);
-      assert.ok(pair.sims[0].steps.length - before <= 2, 'one poll cannot exceed the two-tick resimulation budget');
-      sawPartial ||= pair.sessions[0].resimulating;
-      assert.ok(pair.sessions[0].tick <= 47, 'reconciliation cannot advance beyond its original target');
-    }
-    assert.ok(sawPartial, 'deep rollback needs more than one bounded update');
-    assert.equal(pair.sessions[0].tick, 47);
-    drive(pair, 90);
-    assertConverged(pair, 90);
+    const originalStep = pair.sims[0].adapter.step;
+    let observedActive = false;
+    pair.sims[0].adapter.step = frame => {
+      originalStep(frame);
+      if (frame.resimulating) {
+        observedActive = pair.sessions[0].resimulating;
+        throw new Error('deliberate rollback failure');
+      }
+    };
+    assert.throws(() => pair.sessions[0].poll(pair.link.now), /deliberate rollback failure/);
+    assert.ok(observedActive);
+    assert.equal(pair.sessions[0].resimulating, false);
+    assert.equal(pair.sessions[0].status, 'failed');
   } finally { pair.close(); }
 });
 
@@ -576,43 +609,54 @@ test('a large authority snapshot is chunked below the wire limit and committed a
   } finally { pair.close(); }
 });
 
-test('a budget-one staged snapshot retains the present state until its complete replay commits', () => {
-  const pair = makePair({ inputForTick: () => new Uint8Array([0]), profile: { resimulationBudget: 1 } });
+test('a complete snapshot replays beyond the former budget in one receive call', () => {
+  const pair = makePair({ inputForTick: () => new Uint8Array([0]), profile: { stateHistorySize: 96 } });
   try {
-    drive(pair, 10);
+    drive(pair, 40);
+    const observed = [];
+    const originalStep = pair.sims[1].adapter.step;
+    pair.sims[1].adapter.step = frame => {
+      observed.push([frame.resimulating, frame.recovering, pair.sessions[1].resimulating, pair.sessions[1].status]);
+      originalStep(frame);
+    };
     pair.sims[1].state[0] += 99;
     const original = [...pair.sims[1].state];
-    const hashes = Array.from({ length: 11 }, (_, tick) => pair.sessions[1].getStateHash(tick));
     assert.equal(pair.sessions[1].requestResync(0), true);
-    let stagedUpdates = 0;
-    for (let round = 0; round < 40 && pair.sessions[1].metrics.recoveries === 0; round++) {
+    let recovered = false;
+    for (let round = 0; round < 40 && !recovered; round++) {
       const before = pair.sims[1].steps.length;
       pair.link.pump();
-      assert.ok(pair.sims[1].steps.length - before <= 1, 'staged recovery honors its per-poll budget');
-      assert.equal(pair.sessions[1].tick, 10);
-      if (pair.sessions[1].metrics.recoveries === 0) {
-        assert.deepEqual([...pair.sims[1].state], original, 'an incomplete candidate remains invisible to gameplay');
-        assert.deepEqual(Array.from({ length: 11 }, (_, tick) => pair.sessions[1].getStateHash(tick)), hashes);
-        if (pair.sessions[1].resimulating) stagedUpdates++;
+      assert.equal(pair.sessions[1].tick, 40);
+      recovered = pair.sessions[1].metrics.recoveries === 1;
+      if (recovered) assert.equal(pair.sims[1].steps.length - before, 40, 'all replay frames execute together');
+      else {
+        assert.equal(pair.sims[1].steps.length, before, 'no partial replay while awaiting snapshot');
+        assert.deepEqual([...pair.sims[1].state], original);
       }
     }
-    assert.ok(stagedUpdates >= 5, 'the ten-tick recovery is staged over multiple updates');
-    assert.equal(pair.sessions[1].metrics.recoveries, 1);
-    assertConverged(pair, 10);
+    assert.ok(recovered);
+    assert.equal(observed.length, 40);
+    assert.ok(observed.every(row => row[0] && row[1] && row[2] && row[3] === 'recovering'));
+    assert.equal(pair.sessions[1].resimulating, false);
+    assertConverged(pair, 40);
   } finally { pair.close(); }
 });
 
 test('an adapter throw during candidate replay restores present state and preserves the old hash ring', () => {
-  const pair = makePair({ inputForTick: () => new Uint8Array([0]), profile: { resimulationBudget: 1 } });
+  const pair = makePair({ inputForTick: () => new Uint8Array([0]) });
   try {
     drive(pair, 10);
     pair.sims[1].state[0] += 99;
     const original = [...pair.sims[1].state];
     const hashes = Array.from({ length: 11 }, (_, tick) => pair.sessions[1].getStateHash(tick));
     const originalStep = pair.sims[1].adapter.step;
+    let observedActive = false;
     pair.sims[1].adapter.step = frame => {
       originalStep(frame);
-      if (frame.recovering && frame.tick === 4) throw new Error('deliberate candidate-only step failure');
+      if (frame.recovering && frame.tick === 4) {
+        observedActive = pair.sessions[1].resimulating;
+        throw new Error('deliberate candidate-only step failure');
+      }
     };
     assert.equal(pair.sessions[1].requestResync(0), true);
     pair.link.drain(30);
@@ -620,14 +664,15 @@ test('an adapter throw during candidate replay restores present state and preser
     assert.equal(pair.sessions[1].metrics.recoveries, 0);
     assert.equal(pair.sessions[1].tick, 10);
     assert.equal(pair.sessions[1].resimulating, false);
+    assert.ok(observedActive);
     assert.deepEqual([...pair.sims[1].state], original);
     assert.deepEqual(Array.from({ length: 11 }, (_, tick) => pair.sessions[1].getStateHash(tick)), hashes);
   } finally { pair.close(); }
 });
 
-test('duplicate transport packets do not abort a large staged snapshot recovery', () => {
+test('duplicate transport packets do not abort a large synchronous snapshot recovery', () => {
   const pair = makePair({ inputForTick: () => new Uint8Array([0]), snapshotPaddingBytes: 65504,
-    profile: { resimulationBudget: 1 }, network: { duplicate: () => true } });
+    network: { duplicate: () => true } });
   try {
     drive(pair, 10);
     pair.sims[1].state[0] += 99;

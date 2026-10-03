@@ -13,7 +13,7 @@ createSession({players:['a'],localPlayerId:'a',sessionId:'prediction',simulation
   profile:{predictionPolicy:({previousInput,lastConfirmedTick})=>lastConfirmedTick>=0?previousInput:new Uint8Array(1)}});
 createNostrRoom({role:'host'}).then(room=>room.close());
 
-const loop=createLoop({session,beforeFrame:timestamp=>timestamp,canAdvance:()=>true,onAdvance:result=>result.tick,maxWorkMs:8,now:()=>0});
+const loop=createLoop({session,beforeFrame:timestamp=>timestamp,canAdvance:()=>true,onAdvance:result=>result.tick});
 loop.pulse(100);loop.resetTiming();
 const diagnostics=runSyncTest({players:['a'],inputSize:1,adapter,frames:[]}).metrics;
 const metrics:SyncTestMetrics=diagnostics;
