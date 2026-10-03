@@ -1,0 +1,10 @@
+<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>N인 WebRTC 토폴로지 검사</title><style>body{font:16px/1.6 system-ui;background:#101d2a;color:#e3f0ed;max-width:1050px;margin:30px auto;padding:20px}button,select{font:inherit;padding:10px;margin:5px;background:#264859;color:inherit;border:1px solid #61899a;border-radius:6px}pre{white-space:pre-wrap;background:#172b38;padding:20px;border-radius:10px}small{color:#a5c5bd}</style>
+<h1>N인 WebRTC 토폴로지 검사</h1><p>실제 RTC 게임 전송 + 라이브러리 Nostr 서명·검증. 시그널링 릴레이만 이 페이지의 테스트 대역을 사용합니다.</p>
+<label>인원 <select id="count"><option>2</option><option>3</option><option selected>4</option><option>8</option></select></label>
+<label>토폴로지 <select id="topology"><option value="mesh">풀메시</option><option value="star">방장 스타</option></select></label>
+<button id="run">선택 검사</button><button id="all">2·3·4·8인 전체 검사</button><button id="cancel">중단</button>
+<p id="status">준비</p><pre id="result">아직 실행하지 않았습니다.</pre>
+<small>같은 브라우저 안의 독립 Session/Adapter를 검사합니다. 서로 다른 기기·외부 NAT와 공개 릴레이 가용성의 검증을 대신하지 않습니다.</small>
+<script type="module" src="/tests/group-browser.mjs"></script></html>
+

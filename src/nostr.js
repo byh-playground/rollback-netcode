@@ -2,7 +2,7 @@ import { integer, nowMs } from './utilities.js';
 import { nostrOrder, nostrEncoder, nostrRequireCrypto, nostrHash, nostrVerify, nostrSign, nostrBytesToNumber, nostrToHex, nostrFromHex, nostrPublicKey } from './nostr-crypto.js';
 const nostrHex32 = /^[0-9a-f]{64}$/;
 const nostrHex64 = /^[0-9a-f]{128}$/;
-const nostrSignalTypes = new Set(['discover', 'presence', 'offer', 'answer', 'ice', 'bye']);
+const nostrSignalTypes = new Set(['discover', 'presence', 'offer', 'answer', 'ice', 'bye', 'group']);
 const nostrContentLimit = 128 * 1024;
 const nostrFreshSeconds = 120;
 const nostrFutureSeconds = 30;
@@ -267,7 +267,7 @@ export async function createNostrSignaler({
     async send(nostrTo, nostrMessage) {
       if (nostrClosed) throw new Error('Nostr signaler closed');
       if (nostrTo !== '*' && (typeof nostrTo !== 'string' || !nostrHex32.test(nostrTo))) throw new TypeError('Nostr recipient must be a lowercase public key or *');
-      if (!nostrIsSignalMessage(nostrMessage)) throw new TypeError('Nostr carries discovery, presence, offer, answer, ice and bye signaling only');
+      if (!nostrIsSignalMessage(nostrMessage)) throw new TypeError('Nostr carries discovery, presence, offer, answer, ice, bye and group signaling only');
       if (nostrSending >= 64) throw new Error('Too many pending Nostr publications');
       if (!nostrStates.some(nostrState => nostrState.ready && !nostrState.failed && nostrState.socket.readyState === 1)) throw new Error('No live Nostr relays');
       nostrSending++;
