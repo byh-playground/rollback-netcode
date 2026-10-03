@@ -705,3 +705,29 @@ test('exported replay uses the same core and matches the online result and oracl
     assert.deepEqual([...replaySimulation.state], oracle(72));
   } finally { pair.close(); }
 });
+
+
+test('synctest frame export clones only a bounded confirmed prefix and excludes predicted inputs',()=>{
+  const pair=makePair();try{
+    const sequence=pair.sessions[0].queueCommand(new Uint8Array([17]));drive(pair,180);assertConverged(pair,180,oracle(180,stream,[{playerId:'a',sequence,executeTick:0,payload:new Uint8Array([17])}]));
+    const session=pair.sessions[0],sample=session.exportSyncTestFrames({maxFrames:2});
+    assert.equal(sample.initialTick,0);assert.deepEqual(sample.players,IDS);assert.equal(sample.frames.length,2);
+    assert.ok(sample.frames.every(frame=>frame.inputs.every(input=>!input.predicted)));
+    const snapshot=sample.initialState.slice(),first=sample.frames[0].inputs[0].input.slice();
+    sample.initialState.fill(99);sample.players.reverse();sample.frames[0].inputs[0].input.fill(99);
+    const commands=sample.frames[0].inputs[0].commands;if(commands.length)commands[0].payload.fill(99);
+    const fresh=session.exportSyncTestFrames({maxFrames:2});assert.deepEqual(fresh.initialState,snapshot);assert.deepEqual(fresh.players,IDS);
+    assert.deepEqual(fresh.frames[0].inputs[0].input,first);assert.equal(fresh.frames[0].inputs[0].commands[0].payload[0],17);
+    const untouched=session._replayFrames[2];Object.defineProperty(untouched,'inputs',{get(){throw Error('copied unselected frame')}});
+    assert.equal(session.exportSyncTestFrames({maxFrames:2}).frames.length,2);
+    for(const maxFrames of [0,257,1.5])assert.throws(()=>session.exportSyncTestFrames({maxFrames}),/maxFrames/);
+    session._rollbackFrom=0;assert.throws(()=>session.exportSyncTestFrames(),/finish rollback/);session._rollbackFrom=Infinity;
+  }finally{pair.close()}
+});
+test('synctest frame export never fabricates missing frames after replay recording stops',()=>{
+  const pair=makePair({profile:{maxReplayBytes:120}});try{
+    drive(pair,180);assertConverged(pair,180);const session=pair.sessions[0],replay=session.exportReplay(),sample=session.exportSyncTestFrames({maxFrames:256});
+    assert.equal(replay.truncated,true);assert.ok(sample.frames.length<180);assert.equal(sample.frames.length,replay.frames.length);
+    assert.deepEqual(sample.frames,replay.frames);
+  }finally{pair.close()}
+});

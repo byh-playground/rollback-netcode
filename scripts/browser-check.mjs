@@ -69,6 +69,35 @@ try {
   await Promise.all(pages.map(page => page.goto(url)));
   assert.deepEqual(browserErrors, [], 'both browser pages must load the ES module without errors');
   await Promise.all(pages.map(page => page.waitForFunction(() => Boolean(window.harness), null, { timeout })));
+  const capabilities = await pages[0].evaluate(async () => {
+    const { createLoop, createSession, runSyncTest, runSyncTestAsync } = await import('/rollback-netcode.js');
+    let tick=0,clock=0,allowed=true,polls=0,renders=0;
+    const session={inputSize:1,profile:{tickRate:20,maxCatchupSteps:5},metrics:{pace:1},closed:false,resimulating:false,
+      poll(){polls++;if(this.resimulating)this.resimulating=false},advance(){if(clock!==250)throw Error('frame clock');return{status:'advanced',tick:++tick}}};
+    const loop=createLoop({session,beforeFrame:t=>{clock=t},canAdvance:()=>allowed,onAdvance:()=>{allowed=false},render:()=>renders++});
+    loop.pulse(0);loop.pulse(250);session.resimulating=true;loop.pulse(500);
+    const loopPassed=tick===1&&polls===3&&renders===3&&!session.resimulating;
+    let value=0;
+    const adapter={save:()=>new Uint8Array([value]),load:b=>{value=b[0]},validateSnapshot:b=>b.length===1,
+      step:ctx=>{value=(value+ctx.inputs[0].input[0])%256}};
+    const result=runSyncTest({adapter,players:['a'],inputSize:1,checkDistance:2,
+      frames:Array.from({length:4},(_,tick)=>({tick,inputs:[{playerId:'a',input:new Uint8Array([1])}]}))});
+    let heartbeats=0;const heartbeat=setInterval(()=>heartbeats++,0);
+    let asyncResult;
+    try{asyncResult=await runSyncTestAsync({adapter,players:['a'],inputSize:1,checkDistance:2,
+      frames:Array.from({length:4},(_,tick)=>({tick,inputs:[{playerId:'a',input:new Uint8Array([1])}]}))})}
+    finally{clearInterval(heartbeat)}
+    const diagnosticsRestored=value===0;
+    const core=createSession({adapter,players:['a'],localPlayerId:'a',sessionId:'bounded-browser',simulationVersion:'1',inputSize:1,
+      profile:{baseInputDelayTicks:0,minInputDelayTicks:0,maxInputDelayTicks:0,adaptiveInputDelay:false,pacingPolicy:'none'}});
+    for(let i=0;i<6;i++)core.advance(new Uint8Array([1]));
+    const prefix=core.exportSyncTestFrames({maxFrames:2});prefix.frames[0].inputs[0].input[0]=99;
+    const boundedPassed=prefix.frames.length===2&&prefix.initialTick===0&&core.exportSyncTestFrames({maxFrames:2}).frames[0].inputs[0].input[0]===1;
+    core.close();
+    return {loopPassed,boundedPassed,asyncPassed:heartbeats>0&&asyncResult.hash===result.hash&&diagnosticsRestored,heartbeats,metricsPassed:Object.isFrozen(result.metrics)&&result.metrics.checkedTicks===4&&result.metrics.resimulatedTicks===7&&diagnosticsRestored,
+      metrics:result.metrics};
+  });
+  assert.ok(capabilities.loopPassed&&capabilities.metricsPassed&&capabilities.asyncPassed&&capabilities.boundedPassed, `browser capability verification: ${JSON.stringify(capabilities)}`);
   await Promise.all(pages.map((page, index) => page.evaluate(({ id, initiator }) => window.harness.createPeer(id, initiator), { id: index ? 'b' : 'a', initiator: index === 0 })));
 
   // Node relays SDP and ICE candidates; all game traffic travels through WebRTC.
@@ -106,7 +135,7 @@ try {
   }
   const peers = await Promise.all(pages.map(page => page.evaluate(target => window.harness.report(target), targetTick)));
   report = { passed: peers.every(peer => peer.passed) && peers[0].hash === peers[1].hash && browserErrors.length === 0,
-    transport: 'two real RTCPeerConnections in separate browser contexts', relayedCandidates, browserErrors, peers };
+    transport: 'two real RTCPeerConnections in separate browser contexts', relayedCandidates, browserErrors, capabilities, peers };
   await mkdir(resultsDirectory, { recursive: true });
   await writeFile(resolve(resultsDirectory, 'browser-report.json'), `${JSON.stringify(report, null, 2)}\n`);
   await Promise.all(pages.map((page, index) => page.screenshot({ path: resolve(resultsDirectory, `browser-peer-${index ? 'b' : 'a'}.png`), fullPage: true })));

@@ -682,6 +682,15 @@ export class RollbackSession {
       this._replayFinalState = this._history.get(t + 1);
     }
   }
+  exportSyncTestFrames({maxFrames=32}={}) {
+    integer(maxFrames,'maxFrames',1,256);
+    if (this.resimulating) throw new Error('finish rollback before exporting synctest frames');
+    this._recordConfirmed();
+    return { initialState: this._initialState.slice(), players: [...this.players],
+      inputSize: this.inputSize, tickRate: this.profile.tickRate, initialTick: 0,
+      frames: this._replayFrames.slice(0,maxFrames).map(f => ({ tick: f.tick,
+        inputs: f.inputs.map(x => ({ ...copyFrame(x), playerId: x.playerId, predicted: false })) })) };
+  }
   exportReplay() {
     if (this.resimulating) throw new Error('finish rollback before exporting replay');
     this._recordConfirmed();

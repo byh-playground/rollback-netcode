@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createSyncTestSession,runSyncTest,DeterminismError,SeededPRNG} from '../rollback-netcode.js';
+import {createSyncTestSession,runSyncTest,runSyncTestAsync,DeterminismError,SeededPRNG} from '../rollback-netcode.js';
 
 function simulation({omitRng=false,omitDeadline=false,alias=false}={}){
   let tick=0,score=0,deadline=3;const random=new SeededPRNG(19),buffer=new Uint8Array(16),steps=[];
@@ -48,4 +48,56 @@ test('invalid diagnostic input is rejected before gameplay; history budget is ch
   const sim=simulation(),s=createSyncTestSession(options(sim)),before=sim.adapter.save();
   assert.throws(()=>s.advance([{playerId:'b',input:new Uint8Array(1)}]),/player/);assert.deepEqual(sim.adapter.save(),before);
   assert.throws(()=>createSyncTestSession({...options(sim),checkDistance:8,maxHistoryBytes:32}),/budget/);
+});
+
+test('SDK metrics snapshots expose diagnostic work without mutable payloads or extra simulation',()=>{
+  const sim=simulation();let clock=0;const s=createSyncTestSession({...options(sim),checkDistance:4,now:()=>++clock});
+  const initial=s.metrics;s.advance(input(0));s.advance(input(1));const m=s.metrics;
+  assert.ok(Object.isFrozen(m));assert.equal(initial.tick,0);assert.equal(m.tick,2);assert.equal(m.checkedTicks,2);
+  assert.equal(m.resimulatedTicks,3);assert.equal(m.historyBytes,48);assert.equal(m.stateHash,s.getStateHash());
+  assert.equal(m.forwardCostMs,2);assert.equal(m.resimulationCostMs,2);assert.equal(m.totalCostMs,4);assert.equal(m.failure,null);
+  s.close();assert.equal(s.metrics.status,'closed');assert.equal(s.metrics.historyBytes,0);assert.equal(s.metrics.stateHash,null);
+});
+test('batch metrics include failure summary and preserve caller state',()=>{
+  const sim=simulation(),frames=Array.from({length:3},(_,tick)=>({tick,inputs:input(tick)}));
+  const r=runSyncTest({...options(sim),checkDistance:2,frames});assert.equal(r.metrics.stateHash,r.hash);assert.equal(r.metrics.checkedTicks,3);
+  const bad=simulation({omitRng:true}),initial=bad.adapter.save();
+  assert.throws(()=>runSyncTest({...options(bad),frames}),e=>{
+    assert.equal(e.syncTestMetrics.status,'failed');assert.equal(e.syncTestMetrics.resimulatedTicks,1);
+    assert.equal(e.syncTestMetrics.failure.firstDifference,4);assert.ok(Object.isFrozen(e.syncTestMetrics.failure));
+    assert.equal('expectedState' in e.syncTestMetrics.failure,false);return true;
+  });assert.deepEqual(bad.adapter.save(),initial);
+});
+
+test('async batch yields before and after each shared session advance and restores caller state',async()=>{
+  const sim=simulation(),before=sim.adapter.save(),frames=Array.from({length:4},(_,tick)=>({tick,inputs:input(tick)}));
+  let yields=0;const pending=runSyncTestAsync({...options(sim),checkDistance:2,frames,yieldControl:async()=>{yields++}});
+  assert.equal(sim.steps.length,0);const result=await pending;
+  assert.equal(yields,8);assert.equal(result.metrics.checkedTicks,4);assert.equal(result.metrics.resimulatedTicks,7);
+  assert.deepEqual(sim.adapter.save(),before);assert.equal(result.hash,runSyncTest({...options(sim),checkDistance:2,frames}).hash);
+});
+test('async abort and determinism failure retain SDK metrics and restore original state',async()=>{
+  const sim=simulation(),before=sim.adapter.save(),controller=new AbortController();let yields=0;
+  const frames=Array.from({length:4},(_,tick)=>({tick,inputs:input(tick)}));
+  await assert.rejects(runSyncTestAsync({...options(sim),frames,signal:controller.signal,yieldControl:()=>{
+    if(++yields===2)controller.abort('user cancelled');
+  }}),error=>{
+    assert.equal(error.name,'AbortError');assert.match(error.message,/user cancelled/);
+    assert.equal(error.syncTestMetrics.status,'failed');assert.equal(error.syncTestMetrics.checkedTicks,1);return true;
+  });assert.deepEqual(sim.adapter.save(),before);
+  const bad=simulation({omitRng:true}),initial=bad.adapter.save();
+  await assert.rejects(runSyncTestAsync({...options(bad),frames,yieldControl:()=>{}}),error=>{
+    assert.ok(error instanceof DeterminismError);assert.equal(error.syncTestMetrics.failure.firstDifference,4);return true;
+  });assert.deepEqual(bad.adapter.save(),initial);
+});
+
+test('Synctest cost includes mandatory forward restore, even if restore throws',()=>{
+  for(const failRestore of [false,true]){
+    const sim=simulation();let clock=0,loads=0;const load=sim.adapter.load;
+    sim.adapter.load=b=>{clock+=10;loads++;if(failRestore&&loads===2)throw Error('restore failed');load(b)};
+    const session=createSyncTestSession({...options(sim),now:()=>clock});
+    if(failRestore)assert.throws(()=>session.advance(input(0)),/restore failed/);else session.advance(input(0));
+    assert.equal(session.metrics.resimulationCostMs,20);assert.equal(session.metrics.totalCostMs,20);
+    assert.equal(session.metrics.status,failRestore?'failed':'running');
+  }
 });
